@@ -2075,6 +2075,9 @@ header.statline { align-items:baseline; }
     //   "text+image" ⇒ 文本和图片 · "text" ⇒ 文本
     //   "" + 合成行 ⇒ 合成（沿用旧 badge，渠道行不可探测）
     //   "" + 上游行 ⇒ 未探测（还没轮到 sweep，或该部署没开 model_caps）
+    // 判死（无文本且无工具）与不可达（发不出探测/5xx/401）的模型已在后端
+    // 目录接口剔除（modelVisible），正常到不了这一列；"unreachable" 分支是
+    // 装配时序缝隙的防御渲染，理由见网关日志。
     // m.synthetic 与 tr 的 data-synthetic 属性照旧维护 —— e2e（verify_wave2_pages.js）靠它。
     var tdSrc = el('td');
     if (m.input_type === 'text+image') {
@@ -2085,6 +2088,10 @@ header.statline { align-items:baseline; }
       var bt = el('span', 'badge real', '文本');
       bt.title = '探测：文本请求与工具调用至少一项可用，图片消息不被接受';
       tdSrc.appendChild(bt);
+    } else if (m.input_type === 'unreachable') {
+      var bu2 = el('span', 'badge callno', '不可达');
+      bu2.title = '探测请求发不出去或上游/账号侧无可判定应答（5xx/429/401/403/链路失败）——正常情况下该模型已从目录隐藏，出现此行请查网关日志';
+      tdSrc.appendChild(bu2);
     } else if (m.synthetic) {
       var b = el('span', 'badge synth', '合成');
       b.title = '渠道声明在用、但上游目录里没有 ⇒ 不可探测、不可勾选';

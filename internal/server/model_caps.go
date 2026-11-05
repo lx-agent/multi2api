@@ -28,18 +28,23 @@ package server
 // # 结果永久有效（用户修订 2026-11-05：判死不重探）
 //
 // 探测结果写盘（store options 表），内存缓存在进程存续期内**永不过期**：
-// 无新模型时 sweep 无事可做，判死的模型也不会被重探。
-// 唯一入口是「目录里出现了没有结果的模型」。要人工复活某个模型：
-// 删掉 options 表里它的 caps.<id> 键（或直接 UPDATE 该值）再等下一轮。
+// 无新模型、也无不可达标记时 sweep 无事可做，判死的模型不会被重探。
+// 入口是「目录里出现了没有确定性结果的模型」（新模型，或上轮不可达的）。
+// 要人工复活某个判死模型：删掉 options 表里它的 caps.<id> 键（或直接 UPDATE
+// 该值）再等下一轮。
 // 注：目录 id 超过 64 字符的模型落不了盘（optionMaxKeyLen），结果只在内存，
 // 重启后会重新探测一次 —— 已知且可接受的退化。
-
 //
-// # 未知 ≠ 判死
+// # 未知 ≠ 判死（2026-11-05 二次修订：未知要写明「不可达」；
+// 三次修订 m01624：不可达直接从目录剔除）
 //
-// 拿不到账号 / 传输层错误 / 5xx / 429 —— 一律记「不确定」，**不写结果**，
-// 模型保留在列表里。只有拿到明确的应答（2xx 或上游明确 4xx 拒绝探测请求）
-// 才落 capResult。误杀一个可用模型比放过一个死模型伤害大得多。
+// 拿不到账号 / 传输层错误 / 5xx / 429 —— **不是模型能力的结论**：不判死、
+// 不落盘，每轮 sweep 都会重探，上游恢复即自动回到目录。但用户明确
+// 「已失效的直接不显示」，所以这类模型同样被剔出目录与 /v1/models，
+// 只是剔除原因逐条写网关日志（capsProbe/capsSweep 行），而不是含糊的
+// 「未探测」。只有拿到明确的应答（2xx 或上游明确 4xx 拒绝探测请求）
+// 才落确定性 capResult。误判死一个可用模型比放过一个死模型伤害大得多，
+// 因此判死只认确定性应答。
 
 import (
 	"context"
@@ -83,19 +88,33 @@ const (
 
 // ── 结果 ────────────────────────────────────────────────────────────────────
 
-// capResult 一个模型的一次确定性探测结果。
+// capResult 一个模型的一次探测结果。两种形态：
+//
+//   - **确定性**（Unreachable=false）：三个能力位是真判据，永久有效、不重探；
+//     ¬text ∧ ¬tools 即判死剔除。
+//   - **不可达标记**（Unreachable=true）：尝试过但拿不到结论（没号/链路失败/
+//     5xx/429/解析失败）。不判死、不剔除，页面显示「不可达」；**每轮 sweep
+//     重探**，上游恢复即被确定性结果覆盖。Reason 只在内存，供日志定位。
 type capResult struct {
-	Text   bool // 最小文本请求拿到了非空应答
-	Tools  bool // 工具调用探测拿到了带函数名的 tool_calls
-	Vision bool // 带图请求被接受并拿到非空应答（见 probeVision 的局限说明）
-	At     time.Time
+	Text        bool // 最小文本请求拿到了非空应答
+	Tools       bool // 工具调用探测拿到了带函数名的 tool_calls
+	Vision      bool // 带图请求被接受并拿到非空应答（见 probeVision 的局限说明）
+	Unreachable bool // 尝试过但无结论（见上）；true 时三个能力位无意义
+	Reason      string
+	At          time.Time
 }
+
+// conclusive 是否为确定性结果（永久有效、不再重探）。
+func (c capResult) conclusive() bool { return !c.Unreachable }
 
 // inputType 返回需求二要的类别值。
 //
 // 工具探测的输入本身就是文本消息，tools=true 即证明文本输入可用
 // （即便正文为空、只回了 tool_calls —— 推理模型正文空是常态）。
 func (c capResult) inputType() string {
+	if c.Unreachable {
+		return InputTypeUnreachable
+	}
 	if c.Vision {
 		return InputTypeTextImage
 	}
@@ -103,10 +122,14 @@ func (c capResult) inputType() string {
 }
 
 // 前端契约取值（catalogViewModel.input_type）。页面把它们映射成中文徽章；
-// 空串 = 未探测/不确定，页面显示「未探测」。
+// 空串 = 还没探到（未入队/在途），页面显示「未探测」。
+// InputTypeUnreachable 正常情况下**不会出现在目录数据里**——不可达行已被
+// modelVisible 剔除（m01624）；保留该取值是防御（装配时序缝隙），页面也照
+// 「不可达」渲染。
 const (
-	InputTypeText      = "text"
-	InputTypeTextImage = "text+image"
+	InputTypeText        = "text"
+	InputTypeTextImage   = "text+image"
+	InputTypeUnreachable = "unreachable"
 )
 
 // capsEnabled 探测机制是否装配开启。
@@ -164,10 +187,13 @@ func (h *Handler) clearProbing(id string) {
 	h.capsMu.Unlock()
 }
 
-// modelVisible 目录过滤判据（需求一）。
+// modelVisible 目录过滤判据（需求一 + 用户修订 2026-11-05 m01624）。
 //
-// 未装配探测 / 该模型无结果（未探测、不确定、渠道合成名）→ 放行。
-// 只有**确定性地** ¬text ∧ ¬tools 才剔除。
+// 未装配探测 / 该模型无结果（未入队/在途/渠道合成名）→ 放行。
+// 确定性 ¬text ∧ ¬tools（判死）→ 剔除。
+// **不可达标记 → 同样剔除**（用户明确：已失效的不显示）。与判死的区别：
+// 不可达不落盘、每轮 sweep 重探，上游恢复即自动回到目录；判死永久有效、
+// 不重探。剔除原因逐条写网关日志（capsSweep/capsProbe 行），页面不再兜留。
 // 生图模型不走 chat 探测，由调用方（applyCapsFilter）单独放行。
 func (h *Handler) modelVisible(id string) bool {
 	if !h.capsEnabled() {
@@ -176,6 +202,9 @@ func (h *Handler) modelVisible(id string) bool {
 	res, ok := h.capsKnown(id)
 	if !ok {
 		return true
+	}
+	if res.Unreachable {
+		return false
 	}
 	return res.Text || res.Tools
 }
@@ -253,6 +282,10 @@ func capsOptionKey(id string) (string, bool) {
 func (h *Handler) persistCaps(id string, res capResult) {
 	if store.DB == nil {
 		return
+	}
+	if res.Unreachable {
+		return // 不可达标记不写盘：它本来就要重探，落盘只会把「瞬时故障」伪装成「持久状态」；
+		// 重启后第一轮 sweep 立即重探，代价为零（内存标记见 probeModel）。
 	}
 	key, ok := capsOptionKey(id)
 	if !ok {
@@ -395,8 +428,9 @@ func (h *Handler) capsSweepOnce(ctx context.Context) {
 		if id == "" {
 			continue
 		}
-		if _, ok := h.caps[id]; ok {
-			continue // 已有结果（含判死）永久跳过 —— 用户修订 2026-11-05：判死不重探，无新模型不探
+		if res, ok := h.caps[id]; ok && res.conclusive() {
+			continue // 确定性结果（含判死）永久跳过 —— 用户修订 2026-11-05：判死不重探、无新模型不探。
+			// 不可达标记**不算有结果**：每轮重探，上游恢复即被确定性结果覆盖（用户 m01504：不可用要写清楚）。
 		}
 		if h.capsProbing[id] {
 			continue // 上一轮还在探（极端慢上游）
@@ -417,6 +451,8 @@ func (h *Handler) capsSweepOnce(ctx context.Context) {
 
 	sem := make(chan struct{}, h.capsConcurrency())
 	var wg sync.WaitGroup
+	var statMu sync.Mutex
+	var doneC, doneU int
 	for _, j := range jobs {
 		if ctx.Err() != nil {
 			h.clearProbing(j.id)
@@ -433,42 +469,52 @@ func (h *Handler) capsSweepOnce(ctx context.Context) {
 					log.Printf("capsProbe %s: recovered panic: %v", j.id, r)
 				}
 			}()
-			res, conclusive := h.probeModel(ctx, j.provider, j.bare) // ctx 是 sweep 入参（循环外单值），闭包捕获安全
-			if !conclusive {
-				h.clearProbing(j.id)
-				return
-			}
-			res.At = time.Now()
+			res := h.probeModel(ctx, j.provider, j.bare) // ctx 是 sweep 入参（循环外单值），闭包捕获安全
 			h.recordCaps(j.id, res)
+			statMu.Lock()
+			if res.conclusive() {
+				doneC++
+			} else {
+				doneU++
+				log.Printf("capsProbe %s: unreachable (%s)", j.id, res.Reason)
+			}
+			statMu.Unlock()
 		}(j)
 	}
 	wg.Wait()
+	if len(jobs) > 0 {
+		log.Printf("capsSweep: probed %d · conclusive %d · unreachable %d", len(jobs), doneC, doneU)
+	}
 }
 
 // ── 单模型探测 ──────────────────────────────────────────────────────────────
 
-// probeModel 对 (provider, bare) 跑三判据。
+// probeModel 对 (provider, bare) 跑三判据，返回确定性结果或「不可达」标记。
 //
-// 返回 (结果, conclusive)。conclusive=false 表示**本轮没有任何确定性结论**
-// （拿不到账号/凭证，或文本判据本身不确定）—— 调用方不写缓存，下轮再探。
-// 一旦文本判据拿到确定结果（成或败），整轮就按「确定」处理：
+// 不可达标记（capResult.Unreachable）= 尝试过但拿不到能力结论：没号/号被占/
+// 没凭证/链路失败/5xx/429/401/403。**401/403 是账号侧问题，绝不能拿来判死
+// 模型** —— 否则凭证一过期整个上游的活模型会被集体误杀剔除。
+// 一旦文本判据拿到确定结果（成或败），整轮按「确定」处理：
 // tools/vision 的基础设施错误降级为 false（宁可标注保守，不可反复重烧额度）。
-func (h *Handler) probeModel(ctx context.Context, provider, bare string) (capResult, bool) {
+func (h *Handler) probeModel(ctx context.Context, provider, bare string) capResult {
+	mark := func(reason string) capResult {
+		return capResult{Unreachable: true, Reason: reason, At: time.Now()}
+	}
 	if h.cfg.Pool == nil {
-		return capResult{}, false
+		return mark("no_pool")
 	}
 	acct := h.cfg.Pool.PickFor(provider, bare, nil)
 	if acct == nil {
-		return capResult{}, false // 该上游此刻没有可用账号：不是模型的问题
+		return mark("no_account") // 该上游此刻没有可用账号：不是模型的问题
 	}
 	if !h.cfg.Pool.Acquire(acct.UID) {
-		return capResult{}, false // 号被在途请求占着：下轮再说
+		return mark("account_busy") // 号被在途请求占着：下轮再说
 	}
 	defer h.cfg.Pool.Release(acct.UID)
 
 	cred, ok := h.credentialFor(provider, acct.UID)
 	if !ok {
-		return capResult{}, false
+		return mark("no_credential")
 	}
 
 	var res capResult
@@ -476,14 +522,16 @@ func (h *Handler) probeModel(ctx context.Context, provider, bare string) (capRes
 	// 1) 文本
 	status, agg, netOK := h.probeAttempt(ctx, provider, cred, probeTextBody(bare))
 	if !netOK {
-		return capResult{}, false
+		return mark("text transport/parse")
 	}
 	switch {
 	case status >= 200 && status < 300:
 		res.Text = probeHasReply(agg)
+	case status == 401 || status == 403:
+		return mark(fmt.Sprintf("text http %d (auth)", status)) // 账号侧故障：判不了模型，更不该判死
 	case status >= 500 || status == 429:
-		return capResult{}, false // 上游侧故障，判不了模型
-	default: // 4xx：上游明确拒绝了这个最小请求 —— 保守判「无文本能力」
+		return mark(fmt.Sprintf("text http %d", status)) // 上游侧故障，判不了模型
+	default: // 其余 4xx：上游明确拒绝了这个最小请求 —— 保守判「无文本能力」
 		res.Text = false
 	}
 
@@ -512,7 +560,8 @@ func (h *Handler) probeModel(ctx context.Context, provider, bare string) (capRes
 		}
 	}
 
-	return res, true
+	res.At = time.Now()
+	return res
 }
 
 // probeAttempt 发一次探测请求并聚合 SSE。

@@ -209,6 +209,8 @@ type Config struct {
 	// 其余字段 0/缺省 = 用代码内默认（间隔 60min / 并发 2 / 单请求 90s）。
 	// 探测结果永久有效（写 options 表，判死不重探）—— 没有 ttl 字段，
 	// 要重探某模型就删它在 options 表里的 caps.<id> 键。
+	// 发不出探测/上游 5xx·429·401 的模型标「不可达」（不落盘、每轮重探，
+	// 恢复即自动改标）——那是链路状态，不是模型能力结论。
 	ModelCaps struct {
 		Enabled       bool `json:"probe_enabled"`
 		SweepEverySec int  `json:"sweep_every_sec"` // 后台扫描间隔

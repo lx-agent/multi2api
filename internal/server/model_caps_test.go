@@ -132,6 +132,36 @@ func TestInputTypeOf(t *testing.T) {
 	if got := h.inputTypeOf("m4"); got != "" {
 		t.Fatalf("unknown m4=%q", got)
 	}
+	h.caps["m5"] = capResult{Unreachable: true, Reason: "text http 503", At: now}
+	if got := h.inputTypeOf("m5"); got != InputTypeUnreachable {
+		t.Fatalf("unreachable m5=%q", got)
+	}
+}
+
+// 不可达语义（m01624）：从目录剔除，但不是判死 —— 无落盘值、conclusive()=false，
+// sweep 每轮重探，恢复后自动回归。
+func TestUnreachableHiddenButRetryable(t *testing.T) {
+	h := newCapsHandler(t, true)
+	h.caps["trae/dead"] = capResult{At: time.Now()} // 确定性 ¬text ∧ ¬tools
+	h.caps["trae/gone"] = capResult{Unreachable: true, Reason: "text transport", At: time.Now()}
+
+	if h.modelVisible("trae/gone") {
+		t.Fatal("unreachable must be hidden from catalog (m01624)")
+	}
+	if h.modelVisible("trae/dead") {
+		t.Fatal("deterministic dead must stay hidden")
+	}
+	if h.modelVisible("trae/never") {
+		// 无结果 = 未探测，仍放行（首次 sweep 前不能把目录清空）。
+		t.Log("unknown kept visible")
+	}
+	if (capResult{Unreachable: true}).conclusive() {
+		t.Fatal("unreachable must not be conclusive (else it never re-probes)")
+	}
+	in := []map[string]any{{"id": "trae/gone"}, {"id": "trae/never"}}
+	if out := h.applyCapsFilter(in); len(out) != 1 || out[0]["id"] != "trae/never" {
+		t.Fatalf("filter must drop only unreachable, got %v", out)
+	}
 }
 
 func TestProbeHasReply(t *testing.T) {
