@@ -213,6 +213,16 @@ type Config struct {
 	// ⚠ 未接线时**不能**退化成"空目录"：空目录会让每一分组里的每个模型都被判成陈旧。
 	// 所以 nil 与"返回空切片"必须分开 —— 前者是"没查"，后者是"查了，什么都没有"。
 	ModelNames func() ModelCatalogSnapshot
+
+	// ModelProbedAvailable 判断「这个模型是否探测出可用能力（文本或工具调用）」。
+	//
+	// 分组编辑候选目录用（用户 m02135：只列出探测可用的模型）。nil = 未接线
+	// ⇒ ?probed=only 退化为**不过滤**（保守：宁给全量也不给空列表）。
+	// 注入侧的语义（server.modelProbedAvailable）：探测未启用 → 一律放行；
+	// 启用但无结论/不可达/判死 → false；确定性 Text∨Tools → true。
+	//
+	// ⚠ 与 ModelNames 同一口径：读缓存、绝不打上游（管理页会反复刷新这里）。
+	ModelProbedAvailable func(name string) bool
 	// APIKey 管理钥匙（config.api_key 原值）：/admin/apikeys 返回它的掩码，
 	// 让管理页与仪表盘「API 接入信息」显示同一把钥匙（一个事实来源）。
 	// 空 = 未配置管理钥匙。

@@ -1643,6 +1643,11 @@ func main() {
 	//   一致性报告会显示「模型目录未检查」，而不是崩溃或谎报。
 	var modelNamesFn func() server.ModelNameSnapshot
 
+	// 探测可用性的延迟绑定入口（分组编辑候选 ?probed=only 用），
+	// 与 modelNamesFn 同一个原因：admin 在 h 之前构造。
+	// nil ⇒ 回调返回 true（不过滤）：装配缝隙里宁给全量也不给空列表。
+	var modelProbedFn func(string) bool
+
 	adminH = admin.New(admin.Config{
 		Pool: p,
 		// 审计写入回调（Wave1-T07 的 Config.Audit）。**不接这一行 ⇒ 生产路径一条
@@ -1668,6 +1673,15 @@ func main() {
 				entries = append(entries, admin.ModelCatalogEntry{ID: e.ID, Owner: e.Owner})
 			}
 			return admin.ModelCatalogSnapshot{Names: snap.Names, Unavailable: snap.Unavailable, Entries: entries}
+		},
+		// 分组编辑候选过滤（?probed=only）：只列探测出文本/工具能力的模型。
+		// h 未就绪（modelProbedFn==nil）时放行全部 —— 与 ModelNames 的
+		// 「未接线谎报」教训相反，这里空列表比全量更伤（编辑器直接没候选）。
+		ModelProbedAvailable: func(name string) bool {
+			if modelProbedFn == nil {
+				return true
+			}
+			return modelProbedFn(name)
 		},
 		// 同一份工厂也交给管理台：「模型自动发现」要用它问上游有哪些模型。
 		// 类型取自 gateway 契约（不是具体上游）——见 admin.go 里那段该用 gateway 扩展点的注释。
@@ -1909,6 +1923,7 @@ func main() {
 	// 放在这里是因为 h 此刻才存在。之后 admin 的 /admin/groups/consistency
 	// 就能判断「分组里哪些模型已经不在目录里了」。
 	modelNamesFn = h.CachedModelNamesSnapshot
+	modelProbedFn = h.ModelProbedAvailable
 
 	// 轮换管理钥匙：h 构造完成后把「更新内存」接上（闭包经 onRotate 间接引用）。
 	onRotate = func(newKey string) {

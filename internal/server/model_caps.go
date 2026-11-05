@@ -209,6 +209,37 @@ func (h *Handler) modelVisible(id string) bool {
 	return res.Text || res.Tools
 }
 
+// modelProbedAvailable 分组编辑候选的过滤判据（用户 m02135：只列探测可用的模型）。
+//
+// 与 modelVisible 的区别：那条是目录展示判据，未探测**放行**（不能因为探测
+// 没跑到就说网关没有模型）；这里是**选人**判据，语义反过来 —— 没探测出
+// 结论的模型不该出现在候选里（选了也大概率调不通），只有拿到确定性结果
+// 且有文本或工具能力的才列出。生图模型不走 chat 探测、没有 chat 结论，
+// 同样不列（需要时走手填入口）。
+//
+// 探测未启用（未装配 / Enabled=false）→ 一律放行：过滤机制不该在探测
+// 关闭时把候选池清空。
+func (h *Handler) modelProbedAvailable(id string) bool {
+	if !h.capsEnabled() {
+		return true
+	}
+	res, ok := h.capsKnown(id)
+	if !ok {
+		return false
+	}
+	if res.Unreachable {
+		return false
+	}
+	return res.Text || res.Tools
+}
+
+// ModelProbedAvailable 是 modelProbedAvailable 的导出包装：装配层（main.go）
+// 把它注入 admin.Config.ModelProbedAvailable，供 /admin/groups/catalog?probed=only
+// 过滤候选。未接线时调用方拿 nil 回调、自行退化为不过滤。
+func (h *Handler) ModelProbedAvailable(id string) bool {
+	return h.modelProbedAvailable(id)
+}
+
 // inputTypeOf 需求二的列值：目录行 → "text"/"text+image"/""。
 func (h *Handler) inputTypeOf(id string) string {
 	if !h.capsEnabled() {

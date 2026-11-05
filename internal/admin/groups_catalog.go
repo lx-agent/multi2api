@@ -27,6 +27,14 @@ import (
 //
 // ready=false 表示一份都没拿到（目录完全不可用）。此时 models 为空，
 // 界面应提示「目录未就绪」并保留手填入口，而不是显示「一个模型都没有」。
+//
+// # ?probed=only（用户 m02135：分组编辑只列探测可用的模型）
+//
+// 带上该参数时，models/entries 按 ModelProbedAvailable 过滤，只留有确定性
+// 文本/工具能力的模型；响应附 probed_only:true 与 probed_excluded:N（被隐
+// 藏的数量，前端据此提示「还有 N 个未探测/不可达的模型可手填」）。
+// 未接线回调时不过滤（保守防空列表）。一致性检查**不能**带这个参数 ——
+// 它必须拿全量快照，否则「编辑器里选不到 / 检查说它陈旧」的矛盾又回来了。
 func (h *Handler) groupCatalog(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.ModelNames == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -50,14 +58,41 @@ func (h *Handler) groupCatalog(w http.ResponseWriter, r *http.Request) {
 			entries = append(entries, ModelCatalogEntry{ID: n})
 		}
 	}
+	probedOnly := r.URL.Query().Get("probed") == "only"
+	excluded := 0
+	if probedOnly && h.cfg.ModelProbedAvailable != nil {
+		keep := make([]string, 0, len(models))
+		for _, n := range models {
+			if h.cfg.ModelProbedAvailable(n) {
+				keep = append(keep, n)
+			} else {
+				excluded++
+			}
+		}
+		models = keep
+		// entries 用**同一个谓词**过滤（不是 keep 集合反查）：两者来源不同
+		// 时判据也要逐条成立，不能因 entries 缺了某条就悄悄多放。
+		keptEntries := make([]ModelCatalogEntry, 0, len(entries))
+		for _, e := range entries {
+			if h.cfg.ModelProbedAvailable(e.ID) {
+				keptEntries = append(keptEntries, e)
+			}
+		}
+		entries = keptEntries
+	}
 	inc := snap.Unavailable
 	if inc == nil {
 		inc = []string{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"models":     models,
 		"entries":    entries,
 		"incomplete": inc,
 		"ready":      len(models) > 0,
-	})
+	}
+	if probedOnly {
+		resp["probed_only"] = true
+		resp["probed_excluded"] = excluded
+	}
+	writeJSON(w, http.StatusOK, resp)
 }

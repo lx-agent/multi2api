@@ -164,6 +164,40 @@ func TestUnreachableHiddenButRetryable(t *testing.T) {
 	}
 }
 
+// modelProbedAvailable（用户 m02135）：分组编辑候选的选人判据。
+// 与 modelVisible 相反的一点是**未探测也排除**——编辑器里列出一个
+// 还没验证过的模型，选中后调不调得通全凭运气；手填入口保留兜底。
+func TestModelProbedAvailable(t *testing.T) {
+	h := newCapsHandler(t, true)
+	now := time.Now()
+	h.caps["m-text"] = capResult{Text: true, At: now}
+	h.caps["m-tools"] = capResult{Tools: true, At: now}
+	h.caps["m-dead"] = capResult{At: now} // 确定性 ¬text ∧ ¬tools
+	h.caps["m-gone"] = capResult{Unreachable: true, Reason: "text transport", At: now}
+
+	if !h.modelProbedAvailable("m-text") || !h.modelProbedAvailable("m-tools") {
+		t.Fatal("conclusive Text/Tools must be selectable")
+	}
+	if h.modelProbedAvailable("m-dead") {
+		t.Fatal("deterministic negative must not be selectable")
+	}
+	if h.modelProbedAvailable("m-gone") {
+		t.Fatal("unreachable must not be selectable")
+	}
+	if h.modelProbedAvailable("m-never") {
+		t.Fatal("unprobed must NOT be selectable (stricter than modelVisible)")
+	}
+	if h.ModelProbedAvailable("m-text") != h.modelProbedAvailable("m-text") {
+		t.Fatal("exported wrapper must agree")
+	}
+
+	// 探测关闭 ⇒ 谓词恒真：候选池退化为全量，编辑器照常可用。
+	off := newCapsHandler(t, false)
+	if !off.modelProbedAvailable("anything") {
+		t.Fatal("disabled probe must make the predicate inert (no filtering)")
+	}
+}
+
 func TestProbeHasReply(t *testing.T) {
 	mk := func(content any, reasoning string) map[string]any {
 		msg := map[string]any{"content": content}

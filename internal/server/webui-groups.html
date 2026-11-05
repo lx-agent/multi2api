@@ -1637,6 +1637,8 @@ let editing = null;     // 正在编辑的分组 id（null = 新增）
 let catalog = [];       // 候选模型（内部名，来自 /v1/models）
 let catalogOK = false;  // 目录是否真的取到了（false ⇒ 不能把"没拉到"当成"没有模型"）
 let catalogIncomplete = [];
+// ?probed=only 过滤掉的条数（未探测/不可达），0 = 没有过滤或没有隐藏项。
+let catalogProbedExcluded = 0;
 // catalog 的条目形如 {id, owner}（owner 来自 /admin/groups/catalog 的 owned_by，可能为空）。
 // 上游推断走共享的 mpOwnerOf（与 API 管理页同一规则）。  // 本次没查成的来源（上游 id），只用于如实提示
 let picked = new Set(); // 已勾选的模型
@@ -1839,7 +1841,9 @@ async function ensureCatalog() {
     //
     // /admin/groups/catalog 与「一致性检查」共用同一份快照 —— 两处若用不同来源，
     // 会出现「编辑器里选得到 / 检查说它陈旧」这种自相矛盾。
-    const r = await api('/admin/groups/catalog');
+    // ?probed=only：只列探测出文本/工具能力的模型（用户 m02135）——
+    // 未探测、判死（不可达）、无能力的都不进候选池，选了也是白选。手填入口保留。
+    const r = await api('/admin/groups/catalog?probed=only');
     // 优先用 entries（带 owner），退回 models（纯名字，owner 留空由前端切前缀）。
     // ⚠ owner 的作用是「模型名没有上游前缀时」的兜底（单上游部署会这样）。
     // 与 API 管理页的 modelOwnerOf(id, ownedBy) 同一口径。
@@ -1851,14 +1855,19 @@ async function ensureCatalog() {
       return { id: String(m.id || ''), owner: String(m.owner || '') };
     }).filter(function (m) { return m.id; }).sort(function (a, b) { return a.id.localeCompare(b.id); });
     catalogIncomplete = (r && r.incomplete) || [];
+    catalogProbedExcluded = (r && r.probed_only && typeof r.probed_excluded === 'number') ? r.probed_excluded : 0;
     catalogOK = true;
     // 填充上游下拉（与 API 管理页同一个共享函数）。
     // 共享层填充（与 API 管理页同一个函数）。分组页没有 manifest 上下文，rank 传 null ⇒ 字典序。
     mpFillProviderSelect($('gProvider'), catalog, null, '全部上游');
     if (!catalog.length) {
-      // 目录一份都没拿到：明说"未就绪"，不能显示成"这个网关没有模型"。
+      // 候选池为空有两种事实，文案必须分开：目录真没拉到（未就绪），
+      // 还是目录有货但全被探测过滤掉了（未探测/不可达）——后者不是故障。
       $('gChoices').innerHTML = '<span class="err" style="font-size:12px">'
-        + '模型目录尚未就绪（可能刚启动，上游还没拉完）。可以先用下面的输入框直接粘模型名。</span>';
+        + (catalogProbedExcluded > 0
+          ? ('目录里的 ' + catalogProbedExcluded + ' 个模型都还没有「探测可用」结论（未探测、或探测判为不可达/不支持文本与工具调用）。'
+            + '等待首轮能力探测完成后再来，或先用下面的输入框直接粘模型名。')
+          : '模型目录尚未就绪（可能刚启动，上游还没拉完）。可以先用下面的输入框直接粘模型名。') + '</span>';
     }
   } catch (e) {
     catalog = [];
@@ -1882,8 +1891,14 @@ function renderChoices() {
   const prov = ($('gProvider') && $('gProvider').value) || '';
   const shown = mpFilter(catalog, prov, q);
   if (!catalog.length) {
-    host.innerHTML = '<span class="muted" style="font-size:12px">目录里没有任何模型。' +
-      '（这通常意味着还没有可用渠道或上游目录没拉到。）</span>';
+    // openForm 里 renderChoices 在 ensureCatalog 之后跑，会覆盖它写的空池文案，
+    // 所以这里的口径与那边一致：区分"探测过滤为空"与"目录没拉到"。
+    host.innerHTML = '<span class="' + (catalogProbedExcluded > 0 ? 'muted' : 'err') + '" style="font-size:12px">'
+      + (catalogProbedExcluded > 0
+        ? ('目录里的 ' + catalogProbedExcluded + ' 个模型都还没有「探测可用」结论（未探测、或探测判为不可达/不支持文本与工具调用）。'
+          + '等待首轮能力探测完成后再来，或先用下面的输入框直接粘模型名。')
+        : '目录里没有任何模型。（这通常意味着还没有可用渠道或上游目录没拉到。）')
+      + '</span>';
     hint.textContent = '';
     return;
   }
@@ -1911,10 +1926,14 @@ function renderChoices() {
   const incom = (typeof catalogIncomplete !== 'undefined' && catalogIncomplete && catalogIncomplete.length)
     ? '；未检查的来源：' + catalogIncomplete.join('、')
     : '';
+  // 探测过滤掉的条数要**明说**：候选池不是目录全集，被隐藏的模型仍可手填。
+  const probedHint = catalogProbedExcluded > 0
+    ? '；已隐藏 ' + catalogProbedExcluded + ' 个未探测/不可达模型（可手填）'
+    : '';
   const prov3 = ($('gProvider') && $('gProvider').value) || '';
   const prefix = prov3 ? ('上游 ' + prov3 + '：' + shown.length + ' 个')
     : ('目录 ' + catalog.length + ' 个模型' + (q ? '，筛出 ' + shown.length + ' 个' : ''));
-  hint.textContent = prefix + incom;
+  hint.textContent = prefix + incom + probedHint;
 }
 
 // pickOne 只改 picked 集合，**不重渲染整个列表** ——
