@@ -1613,7 +1613,7 @@ header.statline { align-items:baseline; }
     <div class="tw">
       <table id="modelsTable">
         <thead><tr>
-          <th class="c-chk"></th><th title="名称前的标记 = 成本倍率（来自 GET /admin/models/preview）；x无 = 该表没有这个模型，x0 = 免费">模型 ID</th><th>供应商</th><th>端点</th><th>来源</th><th title="按控制台 manifest 里该上游的账号数判定；口径见下方说明">可调用</th>
+          <th class="c-chk"></th><th title="名称前的标记 = 成本倍率（来自 GET /admin/models/preview）；x无 = 该表没有这个模型，x0 = 免费">模型 ID</th><th>供应商</th><th>端点</th><th title="网关实测上游模型的输入类型（文本 / 文本和图片）；判据与剔除规则见 internal/server/model_caps.go；合成行与未探测的显示原因">输入类型</th><th title="按控制台 manifest 里该上游的账号数判定；口径见下方说明">可调用</th>
         </tr></thead>
         <tbody id="modelRows"></tbody>
       </table>
@@ -2070,13 +2070,29 @@ header.statline { align-items:baseline; }
     var eps = (m.endpoints && m.endpoints.length) ? m.endpoints.join(' / ') : '';
     if (eps) { tr.appendChild(el('td', 'ep', eps)); } else { tr.appendChild(el('td', 'ep', '—')); }
 
+    // 输入类型列（需求 2026-11-05：原「来源」列改造）。
+    // 数据来自 m.input_type（后端 catalogViewModel.InputType）：
+    //   "text+image" ⇒ 文本和图片 · "text" ⇒ 文本
+    //   "" + 合成行 ⇒ 合成（沿用旧 badge，渠道行不可探测）
+    //   "" + 上游行 ⇒ 未探测（还没轮到 sweep，或该部署没开 model_caps）
+    // m.synthetic 与 tr 的 data-synthetic 属性照旧维护 —— e2e（verify_wave2_pages.js）靠它。
     var tdSrc = el('td');
-    if (m.synthetic) {
+    if (m.input_type === 'text+image') {
+      var bi = el('span', 'badge real', '文本和图片');
+      bi.title = '探测：带图片的消息被正常应答';
+      tdSrc.appendChild(bi);
+    } else if (m.input_type === 'text') {
+      var bt = el('span', 'badge real', '文本');
+      bt.title = '探测：文本请求与工具调用至少一项可用，图片消息不被接受';
+      tdSrc.appendChild(bt);
+    } else if (m.synthetic) {
       var b = el('span', 'badge synth', '合成');
-      b.title = '渠道声明在用、但上游目录里没有 ⇒ 目录里查不到它的出身，且不可勾选';
+      b.title = '渠道声明在用、但上游目录里没有 ⇒ 不可探测、不可勾选';
       tdSrc.appendChild(b);
     } else {
-      tdSrc.appendChild(el('span', 'badge real', '上游目录'));
+      var bu = el('span', 'badge callunknown', '未探测');
+      bu.title = '能力探测还没覆盖到它（后台 sweep 周期性进行，或配置 model_caps.enabled=false 已关闭）';
+      tdSrc.appendChild(bu);
     }
     tr.appendChild(tdSrc);
     // 2026-10-27 新增两列（用户要求「表格需要再添加一列信息」+ 移植倍率检测）

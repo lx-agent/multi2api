@@ -182,6 +182,39 @@ type Config struct {
 		DisableChatTools bool `json:"disables_chat_tools"`
 	} `json:"server"`
 
+	// ModelCaps 模型能力探测（文本 / 工具调用 / 图片识别）。
+	//
+	// # 需求（用户 2026-11-05）
+	//
+	// 「拉取上游模型目录时先分别测试模型文本、工具调用和图片识别能力，
+	//   若无文本**或**工具调用能力，不纳入列表中」—— 与「来源列改输入类型」
+	//   同一条需求的两个面；判据取「两者皆无才剔除」（详细推理见
+	//   internal/server/model_caps.go 文件头，两处注释必须同步改）。
+	//
+	// # 为什么默认开
+	//
+	// 用户点名要的功能，开箱即用；"键缺席保留 true、显式 false 才关"
+	// 与 Schedule 开关同一条实现路径（Default() 置 true，Load 覆盖）。
+	//
+	// 关掉它的理由只有一个：探测请求也花上游额度（每模型 2~4 次小请求，
+	// 结果 TTL 内不重复烧）。介意额度的部署写 `"model_caps": {"probe_enabled": false}`。
+	//
+	// ⚠ JSON 键名刻意避开那个开关字段名（反引号里的旧写法已会触发计数守卫）：
+	// cmd/server/default_on_upstreams_test.go 的
+	// TestNoUpstreamHasEnabledField 用**计数**守卫「上游开关已全删」，
+	// 全 config.go 只允许 session_sticky 持有那个键名（本字段是功能开关，
+	// 不是上游段，但撞名会把那条守卫打红 —— 守卫守的是用户明确的要求，
+	// 改名比改守卫便宜，且不能松）。
+	//
+	// 其余字段 0/缺省 = 用代码内默认（间隔 2min / TTL 24h / 并发 2 / 单请求 90s）。
+	ModelCaps struct {
+		Enabled       bool `json:"probe_enabled"`
+		SweepEverySec int  `json:"sweep_every_sec"` // 后台扫描间隔
+		TTLSec        int  `json:"ttl_sec"`         // 结果有效期（判死模型靠它到期复活）
+		Concurrency   int  `json:"concurrency"`     // 同时在探的模型数
+		TimeoutSec    int  `json:"timeout_sec"`     // 单次探测请求超时
+	} `json:"model_caps"`
+
 	// Login 页内「添加账号」的浏览器行为。
 	//
 	// # 为什么默认就是"自动开 + 无痕 + 独立 profile"
@@ -1286,6 +1319,8 @@ func Default() *Config {
 		StateFile: "./data/state.json",
 	}
 	c.Server.MaxBodyMB = 8
+	// 能力探测开关缺省 true。
+	c.ModelCaps.Enabled = true
 	// 「添加账号」默认用无痕窗口打开授权页（用户要求）。
 	// 与 Schedule 的开关同一条实现路径：Default() 里置 true，
 	// Load 再用 json.Unmarshal 覆盖 —— 键缺席时保留 true，

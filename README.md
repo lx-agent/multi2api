@@ -193,6 +193,7 @@ Claude Code / Cursor 等）不需要在配置里声明任何工具**：
 | `pool.*` | — | 账号池：熔断阈值、在途上限、冷却时长、`health_check_interval_seconds`（冷却探活，默认 600s）、`revive_probe_interval_seconds`（解封探活，默认 86400s / 24 小时，设置页可改） |
 | `schedule.*` | — | 签到 / 保活的间隔与开关（**统一 30 分钟被动扫描**） |
 | `session_sticky.*` | `enabled=true` / `ttl=30m` / `gc_interval=5m` | 会话粘性：同一会话固定用同一账号 |
+| `model_caps.*` | `probe_enabled=true` / 间隔 120s / TTL 86400s | 模型能力探测：拉目录后实测文本/工具/图片，文本与工具**皆无**才剔出列表；`sweep_every_sec` / `ttl_sec` / `concurrency` / `timeout_sec` 可调（判据与理由见 `internal/server/model_caps.go` 文件头） |
 | `upstream.*` | 内嵌默认 | 出站身份（UA / 客户端版本 / 设备 token / IP 透传） |
 | `prompt.*` | 内嵌默认 | 系统提示词（`mode` = `custom` / `passthrough`，空值按 `custom`；`file` 可指向自定义文件） |
 | `upstash.*` | — | 可选 Redis/Upstash 后端；不配则纯内存 |

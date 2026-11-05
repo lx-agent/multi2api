@@ -546,6 +546,12 @@ type catalogViewModel struct {
 	// 页面的"不可勾选"必须来自数据而不是前端自己再推一遍 —— 两处推导
 	// 迟早分叉（一边改了另一边不改，表现是"看起来能勾、点了没反应"）。
 	Selectable bool `json:"selectable"`
+	// InputType 输入类型（需求 2026-11-05，替换页面上的「来源」列）：
+	//   "text"        ⇒ 文本
+	//   "text+image"  ⇒ 文本和图片
+	//   ""            ⇒ 未探测（含渠道合成行——合成名不走上游，探不了）
+	// 判据与剔除规则同源，见 internal/server/model_caps.go。
+	InputType string `json:"input_type,omitempty"`
 }
 
 // catalogViewVendor 是页面 Vendor tab 的一行（由 Model 行聚合而来）。
@@ -605,12 +611,20 @@ func (h *Handler) catalogView() (models []catalogViewModel, vendors []catalogVie
 		source = "store"
 		models = make([]catalogViewModel, 0, len(rows))
 		for _, r := range rows {
+			// 能力探测剔除与 memory 档、/v1/models **同一判据**（modelVisible）：
+			// 库里的行是 seed 时刻的快照，判死必须发生在**读出的这一刻**，
+			// 否则 sweep 刚把某模型探死、页面还要等下一轮 seed 才消失。
+			// 合成行不探（渠道名不在上游目录里，没有可探测的落点），直接放行。
+			if !r.Synthetic && !h.modelVisible(r.Name) {
+				continue
+			}
 			models = append(models, catalogViewModel{
 				Name:       r.Name,
 				Vendor:     r.Vendor,
 				Endpoints:  splitCatalogEndpoints(r.EndpointsCSV),
 				Synthetic:  r.Synthetic,
 				Selectable: !r.Synthetic,
+				InputType:  h.inputTypeOf(r.Name),
 			})
 		}
 	} else {
@@ -626,6 +640,11 @@ func (h *Handler) catalogView() (models []catalogViewModel, vendors []catalogVie
 				Endpoints:  splitCatalogEndpoints(strings.Join(e.Endpoints, ",")),
 				Synthetic:  e.Synthetic,
 				Selectable: !e.Synthetic,
+				// memory 档的过滤/输入类型都在上游目录出口（upstreamCatalogEntries →
+				// modelListWithScrub → applyCapsFilter）做完；这里的键 = 上游内部 id，
+				// ⚠ 配了 ProviderAlias 时 Name 是代号，缓存里查不到 ⇒ 显示未探测
+				//   （fail-open，只影响标注、不影响可用性）—— 代号部署本就少见。
+				InputType: h.inputTypeOf(e.Name),
 			})
 		}
 	}

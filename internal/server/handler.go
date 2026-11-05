@@ -297,6 +297,16 @@ type Config struct {
 	// 此时 /v1/models 与选号都保持单上游行为。
 	DefaultProvider string
 
+	// Caps 模型能力探测（文本/工具/图片）的接线参数（可选；nil 或 Enabled=false = 关闭）。
+	//
+	// 需求（用户 2026-11-05）：拉取上游模型目录时先探测能力，
+	// 既无文本又无工具能力的模型不进目录；管理页「来源」列显示输入类型。
+	// 完整设计/判据/局限说明见 model_caps.go 文件头。
+	//
+	// ⚠ server 包内默认关闭（nil 即关闭）：既有测试与未装配部署零行为变化；
+	//   装配层（cmd/server）默认打开 —— 用户要的是开箱即用。
+	Caps *CapsProbeConfig
+
 	// DisableChatTools 关闭「上游工具自动注入」。
 	//
 	// 默认 false（开启）—— 用户要求「我要生图的话，它自动调用生图模型」，
@@ -339,6 +349,15 @@ type Handler struct {
 	prewarmMu          sync.Mutex
 	prewarmOn          bool
 	prewarmLastFailLog time.Time
+	// ── 模型能力探测（见 model_caps.go；同一 per-handler 纪律）──────────────
+	//
+	// caps: 目录 id → 最近一次确定性结果；capsProbing: 在途标记（防同轮重复排队）。
+	// 只在后台 sweep 与出口只读路径触碰，都是低频操作，一张 RWMutex 足够。
+	capsMu      sync.RWMutex
+	caps        map[string]capResult
+	capsProbing map[string]bool
+	capsSweepMu sync.Mutex
+	capsSweepOn bool
 	// apiKey 当前生效的管理钥匙（config api_key，支持运行时轮换）。
 	// 与 cfg.APIKey 解耦：轮换写回 config 后调用 SetAPIKey 立即生效，无需重启。
 	//
@@ -420,7 +439,12 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxBodyMB <= 0 {
 		cfg.MaxBodyMB = defaultMaxBodyMB
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), apiKey: cfg.APIKey, adminToken: cfg.AdminToken}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), apiKey: cfg.APIKey, adminToken: cfg.AdminToken,
+		caps: map[string]capResult{}, capsProbing: map[string]bool{}}
+	// 能力探测结果回填（重启不重烧上游额度；库未接线时静默跳过）。
+	if cfg.Caps != nil && cfg.Caps.Enabled {
+		h.loadCapsFromStore()
+	}
 	registerCatalogHost(h) // 让包级 ModelCatalog/ModelCatalogState 能找到本实例的缓存
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// 生图出口（OpenAI Images API 形状）。
@@ -949,6 +973,15 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // 完全退化成改造前的单上游行为：**只有裸名，没有任何前缀记录**。
 // 这是既有测试与既有部署的路径，字节级不变。
 func (h *Handler) modelListWithScrub(scrub bool) []map[string]any {
+	// 能力探测过滤（需求 2026-11-05）：/v1/models、目录 seed、目录 memory 档
+	// 都从这里走 ⇒ 三条路同一判据，T09「seed == /v1/models 可见集合」不变式
+	// 靠**同一出口**保持，而不是靠两处各写一遍。生图条目由 applyCapsFilter 豁免。
+	return h.applyCapsFilter(h.modelListRawWithScrub(scrub))
+}
+
+// modelListRawWithScrub 是**未经能力探测过滤**的目录出口 —— 探测队列从它枚举
+// （判死的模型必须仍在队列里才有机会随 TTL 到期复活；见 model_caps.go capsSweepOnce）。
+func (h *Handler) modelListRawWithScrub(scrub bool) []map[string]any {
 	// 单上游模式：与改造前逐字节一致（除账号判据，见 singleProviderModelList）。
 	if h.cfg.Provider == nil {
 		return h.singleProviderModelList(h.ownedBy(), scrub)

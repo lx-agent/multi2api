@@ -1886,7 +1886,15 @@ func main() {
 		// 注册表 + 账号池在这一层合并成出口层要的那个小接口。
 		Provider:        registryRouter{reg: registry, p: p},
 		DefaultProvider: func() string { id, _ := registry.First(); return id }(),
-		Admin:           adminH, // 已在上方构造（回调需要引用它，见那段注释）
+		// 模型能力探测：开关缺席=true（Default() 口径），间隔等 0 值由 server 侧回落默认。
+		Caps: &server.CapsProbeConfig{
+			Enabled:     cfg.ModelCaps.Enabled,
+			SweepEvery:  time.Duration(cfg.ModelCaps.SweepEverySec) * time.Second,
+			TTL:         time.Duration(cfg.ModelCaps.TTLSec) * time.Second,
+			Concurrency: cfg.ModelCaps.Concurrency,
+			Timeout:     time.Duration(cfg.ModelCaps.TimeoutSec) * time.Second,
+		},
+		Admin: adminH, // 已在上方构造（回调需要引用它，见那段注释）
 	})
 	// 把「模型输出上限」的查询注入 Anthropic 转换层。
 	//
@@ -2082,6 +2090,11 @@ func main() {
 	// 传 ctx：随优雅停机一起取消（StartModelsPrewarm 内部 select ctx.Done() 退出）。
 	// 放在 ListenAndServe **之前**：让窗口在第一个请求到达前就关上。
 	h.StartModelsPrewarm(ctx, 0)
+	// 模型能力探测（文本/工具/图片，见 internal/server/model_caps.go）。
+	// 与预热同一纪律：后台灌缓存，请求路径只读；开关在 server.Config.Caps，
+	// 装配层默认开（config `model_caps.enabled`，显式 false 才关）。
+	// 未接线（Provider == nil 的单上游形态）时 sweep 自己会跳过。
+	h.StartModelCapsProbe(ctx)
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
