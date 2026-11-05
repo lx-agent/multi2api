@@ -272,3 +272,64 @@ func TestProbeBodiesUseBareModel(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractSSEError(t *testing.T) {
+	// 嵌套 error 对象（trae/workbuddy 格式）
+	traeSSE := `data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1793851950,"id":"chatcmpl-1","model":"","object":"chat.completion.chunk"}
+
+data: {"error":{"code":"4001","message":"We're sorry, the param is invalid. Please try with a valid param."}}
+
+data: [DONE]
+`
+	got := extractSSEError(traeSSE)
+	if got == nil {
+		t.Fatal("trae nested error not extracted")
+	}
+	e, ok := got["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error key not a map: %v", got)
+	}
+	if e["code"] != "4001" {
+		t.Fatalf("code=%v want 4001", e["code"])
+	}
+	msg, _ := e["message"].(string)
+	if !strings.Contains(msg, "param is invalid") {
+		t.Fatalf("message=%q", msg)
+	}
+
+	// 顶层 error_code/error_msg（codearts 格式）
+	codeartsSSE := `data:{"text":"[DONE]","error_code":"TM.000010051","error_msg":"您当前无权调用该模型，请联系企业管理员开通。"}
+`
+	got = extractSSEError(codeartsSSE)
+	if got == nil {
+		t.Fatal("codearts error not extracted")
+	}
+	e = got["error"].(map[string]any)
+	if e["code"] != "TM.000010051" {
+		t.Fatalf("code=%v want TM.000010051", e["code"])
+	}
+	msg, _ = e["message"].(string)
+	if !strings.Contains(msg, "无权调用") {
+		t.Fatalf("message=%q", msg)
+	}
+
+	// 无 error 的 SSE → nil
+	if extractSSEError(`data: {"choices":[{"delta":{"content":"hi"}}]}
+
+data: [DONE]
+`) != nil {
+		t.Fatal("no error should return nil")
+	}
+	// [DONE] 单独 → nil
+	if extractSSEError("data: [DONE]\n") != nil {
+		t.Fatal("[DONE] should return nil")
+	}
+	// 空 → nil
+	if extractSSEError("") != nil {
+		t.Fatal("empty should return nil")
+	}
+	// garbage → nil
+	if extractSSEError("not json") != nil {
+		t.Fatal("garbage should return nil")
+	}
+}

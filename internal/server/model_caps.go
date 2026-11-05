@@ -524,6 +524,12 @@ func (h *Handler) probeModel(ctx context.Context, provider, bare string) capResu
 	if !netOK {
 		return mark("text transport/parse")
 	}
+	// 上游 HTTP 200 但 SSE 里嵌 error：提取错误码分类
+	if e, ok := agg["error"].(map[string]any); ok {
+		code, _ := e["code"].(string)
+		msg, _ := e["message"].(string)
+		return mark(fmt.Sprintf("text upstream error: %s %s", code, msg))
+	}
 	switch {
 	case status >= 200 && status < 300:
 		res.Text = probeHasReply(agg)
@@ -573,19 +579,23 @@ func (h *Handler) probeAttempt(ctx context.Context, provider string, cred gatewa
 	defer cancel()
 	cs, err := h.chatProvider(cctx, provider, cred, body)
 	if err != nil {
+		log.Printf("capsProbe %s: chatProvider err: %v", provider, err)
 		return 0, nil, false
 	}
 	if cs.Body == nil {
+		log.Printf("capsProbe %s: chatProvider nil Body (status %d)", provider, cs.Status)
 		return cs.Status, nil, false
 	}
 	defer cs.Body.Close()
 	raw, rerr := io.ReadAll(io.LimitReader(cs.Body, maxToolLoopRespBytes))
 	if rerr != nil {
+		log.Printf("capsProbe %s: read body err: %v", provider, rerr)
 		return cs.Status, nil, false
 	}
 	// SSE 与 JSON 两种落地都要能吃：上游对 stream=false 的请求可能直接回 JSON。
 	agg := aggregateProbeResponse(raw)
 	if agg == nil {
+		log.Printf("capsProbe %s: aggregate parse failed, raw head: %.300q", provider, string(raw))
 		return cs.Status, nil, false
 	}
 	return cs.Status, agg, true
@@ -594,6 +604,8 @@ func (h *Handler) probeAttempt(ctx context.Context, provider string, cred gatewa
 // aggregateProbeResponse 把响应字节聚合成 chat.completion 形态 map。
 //
 // wire.Aggregate 吃 SSE；非 SSE（上游真非流式回 JSON）时退回直接解析。
+// SSE 里嵌 error 时（上游 HTTP 200 但流里带错误）提取错误信息返回，
+// 让 probeModel 能分类，而不是一律 transport/parse。
 // 两者都失败返回 nil（调用方按 netOK=false 处理）。
 func aggregateProbeResponse(raw []byte) map[string]any {
 	if len(raw) == 0 {
@@ -609,9 +621,45 @@ func aggregateProbeResponse(raw []byte) map[string]any {
 	}
 	agg, err := wire.Aggregate(strings.NewReader(trimmed))
 	if err != nil || agg == nil {
-		return nil
+		// SSE 里嵌 error：提取错误信息让 probeModel 能分类
+		return extractSSEError(trimmed)
 	}
 	return agg
+}
+
+// extractSSEError 从 SSE 流中提取错误信息。
+//
+// 上游 HTTP 200 但 SSE 里带 error 字段时，wire.Aggregate 无法产出有效
+// completion，返回 nil。这里扫描 data: 行找 error 字段，提取成 map 供
+// probeModel 分类为「不可达（上游报错）」，而不是 transport/parse。
+// 支持两种格式：
+//   - 嵌套 error 对象（trae/workbuddy）：{"error":{"code":"4001","message":"..."}}
+//   - 顶层 error_code/error_msg（codearts）：{"error_code":"TM...","error_msg":"..."}
+func extractSSEError(raw string) map[string]any {
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "[DONE]" || payload == "" {
+			continue
+		}
+		var obj map[string]any
+		if json.Unmarshal([]byte(payload), &obj) != nil {
+			continue
+		}
+		// 嵌套 error 对象（trae/workbuddy 格式）
+		if e, ok := obj["error"].(map[string]any); ok {
+			return map[string]any{"error": e}
+		}
+		// 顶层 error_code/error_msg（codearts 格式）
+		if code, ok := obj["error_code"].(string); ok {
+			msg, _ := obj["error_msg"].(string)
+			return map[string]any{"error": map[string]any{"code": code, "message": msg}}
+		}
+	}
+	return nil
 }
 
 // ── 探测请求体 ──────────────────────────────────────────────────────────────
