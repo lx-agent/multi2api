@@ -255,6 +255,52 @@ data: [DONE]
 	}
 }
 
+// TestAggregateToolCallsSOLOFunctionCall 锁定 Trae/SOLO 上游的 tool_call 形状：
+// 上游用 function_call 字段（而非 OpenAI 标准的 function），并带 SOLO 专属的
+// namespace / partial_arguments 噪声；done 事件常报 finish_reason:"stop"。
+// 回归：曾因 mergeToolCallDelta 只认 function 导致函数名/参数整段丢失，
+// 且 finish_reason 停在 stop（用户报的三个硬伤之二）。
+func TestAggregateToolCallsSOLOFunctionCall(t *testing.T) {
+	raw := `data: {"id":"x1","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function_call":{"name":"get_weather","arguments":""}}]}}]}
+
+data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"function_call":{"arguments":"{\"city\":\"北京\"}","namespace":"trae","partial_arguments":"{\"city\":"},"index":0}]}}]}
+
+data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	choice := resp["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason=%v want tool_calls", choice["finish_reason"])
+	}
+	msg := choice["message"].(map[string]any)
+	calls, ok := msg["tool_calls"].([]map[string]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("tool_calls=%#v", msg["tool_calls"])
+	}
+	fn, ok := calls[0]["function"].(map[string]any)
+	if !ok {
+		t.Fatalf("function missing: %#v", calls[0])
+	}
+	if fn["name"] != "get_weather" {
+		t.Errorf("fn.name=%v", fn["name"])
+	}
+	if fn["arguments"] != `{"city":"北京"}` {
+		t.Errorf("fn.arguments=%q", fn["arguments"])
+	}
+	if _, leaked := fn["namespace"]; leaked {
+		t.Errorf("namespace leaked: %v", fn["namespace"])
+	}
+	if _, leaked := fn["partial_arguments"]; leaked {
+		t.Errorf("partial_arguments leaked: %v", fn["partial_arguments"])
+	}
+}
+
 // streamFrames 把原始 SSE 输入经 Stream 处理后解析出所有 JSON 帧及 [DONE] 计数。
 func streamFrames(t *testing.T, raw string) (frames []map[string]any, doneCount int) {
 	t.Helper()

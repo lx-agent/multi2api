@@ -130,6 +130,40 @@ func writeOpenAIChunk(w io.Writer, payload map[string]any) error {
 	return err
 }
 
+// normalizeSOLOToolCalls 把 SOLO output.tool_calls 归一化成 OpenAI 形状。
+//
+// 上游 SOLO（Trae）的 tool_call 条目用 `function_call` 字段（实测），OpenAI 标准
+// 用 `function`；不转换的话流式 delta 里 name/arguments 恒空、聚合后 function
+// 整个丢失。同时剔除 SOLO 专属的 namespace / partial_arguments 噪声，
+// 只保留标准 OpenAI function 结构（name/arguments）。
+func normalizeSOLOToolCalls(raw json.RawMessage) []map[string]any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		var one map[string]any
+		if json.Unmarshal(raw, &one) != nil {
+			return nil
+		}
+		arr = []map[string]any{one}
+	}
+	for _, call := range arr {
+		if call == nil {
+			continue
+		}
+		if fc, ok := call["function_call"].(map[string]any); ok {
+			call["function"] = fc
+			delete(call, "function_call")
+		}
+		if fn, ok := call["function"].(map[string]any); ok {
+			delete(fn, "namespace")
+			delete(fn, "partial_arguments")
+		}
+	}
+	return arr
+}
+
 // ConvertSOLOToOpenAI 把 SOLO SSE 流逐事件转成 OpenAI SSE chunk 写进 w。
 //
 // 输出保证：至少一个 [DONE]；遇到 event:error 时写错误信封 + [DONE]
@@ -161,6 +195,7 @@ func ConvertSOLOToOpenAI(r io.Reader, w io.Writer) error {
 	st := &sseState{}
 	var pendingUsage map[string]any
 	upstreamErr := error(nil)
+	sawToolCalls := false // 本轮是否出现过 tool_calls（用于 done 时归一化 finish_reason）
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -176,8 +211,9 @@ func ConvertSOLOToOpenAI(r io.Reader, w io.Writer) error {
 				if ev.Reasoning != "" {
 					delta["reasoning_content"] = ev.Reasoning
 				}
-				if len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null" {
-					delta["tool_calls"] = ev.ToolCalls
+				if calls := normalizeSOLOToolCalls(ev.ToolCalls); len(calls) > 0 {
+					delta["tool_calls"] = calls
+					sawToolCalls = true
 				}
 				if len(delta) > 0 {
 					if werr := writeDelta(delta, ""); werr != nil {
@@ -190,6 +226,10 @@ func ConvertSOLOToOpenAI(r io.Reader, w io.Writer) error {
 				finish := ev.FinishReason
 				if finish == "" {
 					finish = "stop"
+				}
+				// 上游 SOLO 带 tool_calls 时 done 仍常报 "stop"；按 OpenAI 规范归一化为 tool_calls。
+				if sawToolCalls && finish != "tool_calls" {
+					finish = "tool_calls"
 				}
 				chunk := base()
 				chunk["choices"] = []any{
@@ -276,6 +316,7 @@ func convertSOLOWithQueue(r io.Reader, w io.Writer, threshold int64, canRetry bo
 	var pendingUsage map[string]any
 	emitted := false
 	upstreamErr := error(nil)
+	sawToolCalls := false // 本轮是否出现过 tool_calls（用于 done 时归一化 finish_reason）
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -291,8 +332,9 @@ func convertSOLOWithQueue(r io.Reader, w io.Writer, threshold int64, canRetry bo
 				if ev.Reasoning != "" {
 					delta["reasoning_content"] = ev.Reasoning
 				}
-				if len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null" {
-					delta["tool_calls"] = ev.ToolCalls
+				if calls := normalizeSOLOToolCalls(ev.ToolCalls); len(calls) > 0 {
+					delta["tool_calls"] = calls
+					sawToolCalls = true
 				}
 				if len(delta) > 0 {
 					if werr := writeDelta(delta, ""); werr != nil {
@@ -311,6 +353,10 @@ func convertSOLOWithQueue(r io.Reader, w io.Writer, threshold int64, canRetry bo
 				finish := ev.FinishReason
 				if finish == "" {
 					finish = "stop"
+				}
+				// 上游 SOLO 带 tool_calls 时 done 仍常报 "stop"；按 OpenAI 规范归一化为 tool_calls。
+				if sawToolCalls && finish != "tool_calls" {
+					finish = "tool_calls"
 				}
 				chunk := base()
 				chunk["choices"] = []any{

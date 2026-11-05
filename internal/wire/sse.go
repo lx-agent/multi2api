@@ -308,6 +308,10 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			calls = append(calls, toolCalls[idx])
 		}
 		message["tool_calls"] = calls
+		// OpenAI 规范：带 tool_calls 的 assistant 消息 finish_reason 必须是
+		// tool_calls。上游（SOLO/Trae）在 done 事件里常报 "stop"，这里统一归一化，
+		// 否则严格客户端会判定"模型没调工具"。
+		finishReason = "tool_calls"
 	}
 	resp := map[string]any{
 		"id":      id,
@@ -330,6 +334,10 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 
 // mergeToolCallDelta 把流式 tool_call 片段合并到累计对象：
 // id/type/function.name 直覆盖（后续分片通常缺省），function.arguments 拼接。
+//
+// 上游 SOLO（Trae）用 `function_call` 字段（实测），OpenAI 标准用 `function`；
+// 两者都兼容，否则 Trae 上游的工具名/参数会整段丢失（表现为 tool_calls 只有
+// id/type、没有 function）。
 func mergeToolCallDelta(merged, delta map[string]any) {
 	if v, ok := delta["id"].(string); ok && v != "" {
 		merged["id"] = v
@@ -339,8 +347,14 @@ func mergeToolCallDelta(merged, delta map[string]any) {
 	}
 	df, _ := delta["function"].(map[string]any)
 	if df == nil {
+		df, _ = delta["function_call"].(map[string]any) // SOLO 专属字段名
+	}
+	if df == nil {
 		return
 	}
+	// 清理 SOLO 专属字段，只保留标准 OpenAI function 结构（name/arguments）。
+	delete(df, "namespace")
+	delete(df, "partial_arguments")
 	mf, _ := merged["function"].(map[string]any)
 	if mf == nil {
 		mf = map[string]any{}
