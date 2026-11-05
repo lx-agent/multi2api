@@ -197,7 +197,7 @@ type Config struct {
 	// 与 Schedule 开关同一条实现路径（Default() 置 true，Load 覆盖）。
 	//
 	// 关掉它的理由只有一个：探测请求也花上游额度（每模型 2~4 次小请求，
-	// 结果 TTL 内不重复烧）。介意额度的部署写 `"model_caps": {"probe_enabled": false}`。
+	// 结果永久写盘、不重复烧）。介意额度的部署写 `"model_caps": {"probe_enabled": false}`。
 	//
 	// ⚠ JSON 键名刻意避开那个开关字段名（反引号里的旧写法已会触发计数守卫）：
 	// cmd/server/default_on_upstreams_test.go 的
@@ -206,11 +206,12 @@ type Config struct {
 	// 不是上游段，但撞名会把那条守卫打红 —— 守卫守的是用户明确的要求，
 	// 改名比改守卫便宜，且不能松）。
 	//
-	// 其余字段 0/缺省 = 用代码内默认（间隔 2min / TTL 24h / 并发 2 / 单请求 90s）。
+	// 其余字段 0/缺省 = 用代码内默认（间隔 60min / 并发 2 / 单请求 90s）。
+	// 探测结果永久有效（写 options 表，判死不重探）—— 没有 ttl 字段，
+	// 要重探某模型就删它在 options 表里的 caps.<id> 键。
 	ModelCaps struct {
 		Enabled       bool `json:"probe_enabled"`
 		SweepEverySec int  `json:"sweep_every_sec"` // 后台扫描间隔
-		TTLSec        int  `json:"ttl_sec"`         // 结果有效期（判死模型靠它到期复活）
 		Concurrency   int  `json:"concurrency"`     // 同时在探的模型数
 		TimeoutSec    int  `json:"timeout_sec"`     // 单次探测请求超时
 	} `json:"model_caps"`

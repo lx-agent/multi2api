@@ -25,11 +25,15 @@ package server
 // （models_prewarm.go）。探测比拉目录更贵（每个模型 2~4 次小请求），
 // 所以同样只在后台 sweep 里做；出口层与页面读的是内存缓存。
 //
-// # 判死的模型如何复活
+// # 结果永久有效（用户修订 2026-11-05：判死不重探）
 //
-// sweep 枚举的是**过滤前**的原始目录（modelListRawWithScrub），
-// 结果有 TTL（缺省 24h）：过期后该模型重新变「未探测」，下一轮 sweep 重探。
-// 上游修复了某模型，网关一天内自动跟上，不需要人工清缓存。
+// 探测结果写盘（store options 表），内存缓存在进程存续期内**永不过期**：
+// 无新模型时 sweep 无事可做，判死的模型也不会被重探。
+// 唯一入口是「目录里出现了没有结果的模型」。要人工复活某个模型：
+// 删掉 options 表里它的 caps.<id> 键（或直接 UPDATE 该值）再等下一轮。
+// 注：目录 id 超过 64 字符的模型落不了盘（optionMaxKeyLen），结果只在内存，
+// 重启后会重新探测一次 —— 已知且可接受的退化。
+
 //
 // # 未知 ≠ 判死
 //
@@ -63,8 +67,6 @@ type CapsProbeConfig struct {
 	Enabled bool
 	// SweepEvery 后台扫描间隔，<=0 回落 capsSweepEveryDefault。
 	SweepEvery time.Duration
-	// TTL 一次探测结果的有效期，<=0 回落 capsTTLDefault。
-	TTL time.Duration
 	// Concurrency 同时在探的模型数，<=0 回落 capsConcurrencyDefault。
 	Concurrency int
 	// Timeout 单次探测请求的超时，<=0 回落 capsProbeTimeoutDefault。
@@ -72,8 +74,7 @@ type CapsProbeConfig struct {
 }
 
 const (
-	capsSweepEveryDefault      = 2 * time.Minute
-	capsTTLDefault             = 24 * time.Hour
+	capsSweepEveryDefault      = 60 * time.Minute
 	capsConcurrencyDefault     = 2
 	capsProbeTimeoutDefault    = 90 * time.Second
 	capsOptionKeyPrefix        = "caps."       // store options 持久化键前缀
@@ -113,13 +114,6 @@ func (h *Handler) capsEnabled() bool {
 	return h.cfg.Caps != nil && h.cfg.Caps.Enabled
 }
 
-func (h *Handler) capsTTL() time.Duration {
-	if h.cfg.Caps != nil && h.cfg.Caps.TTL > 0 {
-		return h.cfg.Caps.TTL
-	}
-	return capsTTLDefault
-}
-
 func (h *Handler) capsSweepEvery() time.Duration {
 	if h.cfg.Caps != nil && h.cfg.Caps.SweepEvery > 0 {
 		return h.cfg.Caps.SweepEvery
@@ -143,14 +137,11 @@ func (h *Handler) capsTimeout() time.Duration {
 
 // ── 缓存读写 ────────────────────────────────────────────────────────────────
 
-// capsFresh 返回 id 的未过期探测结果。
-func (h *Handler) capsFresh(id string) (capResult, bool) {
+// capsKnown 返回 id 的探测结果（永不过期，见文件头「结果永久有效」）。
+func (h *Handler) capsKnown(id string) (capResult, bool) {
 	h.capsMu.RLock()
 	res, ok := h.caps[id]
 	h.capsMu.RUnlock()
-	if !ok || time.Since(res.At) > h.capsTTL() {
-		return capResult{}, false
-	}
 	return res, ok
 }
 
@@ -182,7 +173,7 @@ func (h *Handler) modelVisible(id string) bool {
 	if !h.capsEnabled() {
 		return true
 	}
-	res, ok := h.capsFresh(id)
+	res, ok := h.capsKnown(id)
 	if !ok {
 		return true
 	}
@@ -194,7 +185,7 @@ func (h *Handler) inputTypeOf(id string) string {
 	if !h.capsEnabled() {
 		return ""
 	}
-	res, ok := h.capsFresh(id)
+	res, ok := h.capsKnown(id)
 	if !ok {
 		return ""
 	}
@@ -242,7 +233,8 @@ func (h *Handler) applyCapsFilter(list []map[string]any) []map[string]any {
 //
 // 键 "caps."+目录id（id 含 "provider/model"，长度常 > 前缀，仍受 optionMaxKeyLen=64
 // 约束）；值 "text,tools,vision,atUnix"。任何一步不满足（键太长/含空白/值太长/
-// 库未接线）都**静默跳过**：持久化是尽力而为的加速回填，权威源永远是内存 + 上游。
+// 库未接线）都**静默跳过**：这类模型的结果只在内存，重启后会重探一次 ——
+// 已知退化（见文件头）。落盘的模型则跨重启不重探（用户修订：判死不重探）。
 
 func capsOptionKey(id string) (string, bool) {
 	k := capsOptionKeyPrefix + id
@@ -282,7 +274,6 @@ func (h *Handler) loadCapsFromStore() {
 	if err != nil || len(opts) == 0 {
 		return
 	}
-	now := time.Now()
 	for k, v := range opts {
 		if !strings.HasPrefix(k, capsOptionKeyPrefix) {
 			continue
@@ -295,10 +286,7 @@ func (h *Handler) loadCapsFromStore() {
 		if !ok {
 			continue
 		}
-		// 只回填**还没过期**的；过期的与「未探测」等价，交给 sweep 重探。
-		if now.Sub(res.At) > h.capsTTL() {
-			continue
-		}
+		// 结果永久有效：不管 At 多久以前，一律回填（判死不重探）。
 		h.capsMu.Lock()
 		h.caps[id] = res
 		h.capsMu.Unlock()
@@ -377,7 +365,8 @@ func (h *Handler) StartModelCapsProbe(ctx context.Context) {
 	}()
 }
 
-// capsSweepOnce 一轮扫描：枚举**过滤前**的原始目录，对无新鲜结果且不在探的模型并行探测。
+// capsSweepOnce 一轮扫描：枚举**过滤前**的原始目录，只对**尚无结果**且不在探的
+// 模型并行探测（结果永久有效 ⇒ 稳态下这里通常是空队列）。
 func (h *Handler) capsSweepOnce(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -406,8 +395,8 @@ func (h *Handler) capsSweepOnce(ctx context.Context) {
 		if id == "" {
 			continue
 		}
-		if res, ok := h.caps[id]; ok && time.Since(res.At) <= h.capsTTL() {
-			continue // 新鲜结果（含判死结果 —— 判死的复活靠 TTL 到期，不靠每轮重烧）
+		if _, ok := h.caps[id]; ok {
+			continue // 已有结果（含判死）永久跳过 —— 用户修订 2026-11-05：判死不重探，无新模型不探
 		}
 		if h.capsProbing[id] {
 			continue // 上一轮还在探（极端慢上游）

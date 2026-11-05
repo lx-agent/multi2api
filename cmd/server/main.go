@@ -1890,7 +1890,6 @@ func main() {
 		Caps: &server.CapsProbeConfig{
 			Enabled:     cfg.ModelCaps.Enabled,
 			SweepEvery:  time.Duration(cfg.ModelCaps.SweepEverySec) * time.Second,
-			TTL:         time.Duration(cfg.ModelCaps.TTLSec) * time.Second,
 			Concurrency: cfg.ModelCaps.Concurrency,
 			Timeout:     time.Duration(cfg.ModelCaps.TimeoutSec) * time.Second,
 		},

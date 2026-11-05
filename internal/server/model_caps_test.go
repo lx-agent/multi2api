@@ -65,7 +65,7 @@ func TestApplyCapsFilter(t *testing.T) {
 	h.caps["trae/dead"] = capResult{At: now} // ¬text ∧ ¬tools，确定性判死
 	h.caps["trae/text"] = capResult{Text: true, At: now}
 	h.caps["trae/toolsonly"] = capResult{Tools: true, At: now}
-	h.caps["trae/stale-dead"] = capResult{At: now.Add(-25 * time.Hour)} // 过期 = 未探测
+	h.caps["trae/old-dead"] = capResult{At: now.Add(-30 * 24 * time.Hour)} // 判死永久有效（无 TTL 复活）
 
 	entry := func(id string, image bool) map[string]any {
 		e := map[string]any{"id": id}
@@ -79,14 +79,14 @@ func TestApplyCapsFilter(t *testing.T) {
 		entry("trae/text", false),
 		entry("trae/toolsonly", false),
 		entry("trae/unknown", false),
-		entry("trae/stale-dead", false),
+		entry("trae/old-dead", false),
 		entry("trae/draw", true), // 生图豁免：即便没有任何探测结果也必须保留
 	}
 	out := h.applyCapsFilter(in)
 
 	want := map[string]bool{
 		"trae/text": true, "trae/toolsonly": true, "trae/unknown": true,
-		"trae/stale-dead": true, "trae/draw": true,
+		"trae/draw": true,
 	}
 	if len(out) != len(want) {
 		t.Fatalf("len=%d want %d", len(out), len(want))

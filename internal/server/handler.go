@@ -980,7 +980,7 @@ func (h *Handler) modelListWithScrub(scrub bool) []map[string]any {
 }
 
 // modelListRawWithScrub 是**未经能力探测过滤**的目录出口 —— 探测队列从它枚举
-// （判死的模型必须仍在队列里才有机会随 TTL 到期复活；见 model_caps.go capsSweepOnce）。
+// （只有「无结果的新模型」会入队；判死结果永久跳过，见 model_caps.go 文件头）。
 func (h *Handler) modelListRawWithScrub(scrub bool) []map[string]any {
 	// 单上游模式：与改造前逐字节一致（除账号判据，见 singleProviderModelList）。
 	if h.cfg.Provider == nil {
