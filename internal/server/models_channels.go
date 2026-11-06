@@ -552,6 +552,15 @@ type catalogViewModel struct {
 	//   ""            ⇒ 未探测（含渠道合成行——合成名不走上游，探不了）
 	// 判据与剔除规则同源，见 internal/server/model_caps.go。
 	InputType string `json:"input_type,omitempty"`
+	// Context/MaxOutput/OutMod 目录元数据三列（需求 2026-11-06，用户 m00003）：
+	// 与 InputType 同一数据通道（探针缓存 capsMetaOf），两档行为一致。
+	//   Context/MaxOutput —— 上下文窗口 / 单次最大输出（token 数，0=上游没说）；
+	//   OutMod            —— 输出模态："text"⇒文本，"image"⇒图片（生图条目），
+	//                        ""⇒未知（未探测/判死/上游没声明）。
+	// omitempty：未知的行不带键，页面统一画「—」—— 未知不冒充 0。
+	Context   int64  `json:"context,omitempty"`
+	MaxOutput int64  `json:"max_output,omitempty"`
+	OutMod    string `json:"output_modality,omitempty"`
 }
 
 // catalogViewVendor 是页面 Vendor tab 的一行（由 Model 行聚合而来）。
@@ -618,6 +627,7 @@ func (h *Handler) catalogView() (models []catalogViewModel, vendors []catalogVie
 			if !r.Synthetic && !h.modelVisible(r.Name) {
 				continue
 			}
+			ctxTok, maxOutTok, outMod := h.capsMetaOf(r.Name)
 			models = append(models, catalogViewModel{
 				Name:       r.Name,
 				Vendor:     r.Vendor,
@@ -625,6 +635,7 @@ func (h *Handler) catalogView() (models []catalogViewModel, vendors []catalogVie
 				Synthetic:  r.Synthetic,
 				Selectable: !r.Synthetic,
 				InputType:  h.inputTypeOf(r.Name),
+				Context:    ctxTok, MaxOutput: maxOutTok, OutMod: outMod,
 			})
 		}
 	} else {
@@ -634,6 +645,7 @@ func (h *Handler) catalogView() (models []catalogViewModel, vendors []catalogVie
 		entries = append(entries, h.channelSyntheticCatalogEntries(store.CatalogEntryNames(base))...)
 		models = make([]catalogViewModel, 0, len(entries))
 		for _, e := range entries {
+			ctxTok, maxOutTok, outMod := h.capsMetaOf(e.Name)
 			models = append(models, catalogViewModel{
 				Name:       e.Name,
 				Vendor:     e.Vendor,
@@ -645,6 +657,7 @@ func (h *Handler) catalogView() (models []catalogViewModel, vendors []catalogVie
 				// ⚠ 配了 ProviderAlias 时 Name 是代号，缓存里查不到 ⇒ 显示未探测
 				//   （fail-open，只影响标注、不影响可用性）—— 代号部署本就少见。
 				InputType: h.inputTypeOf(e.Name),
+				Context:   ctxTok, MaxOutput: maxOutTok, OutMod: outMod,
 			})
 		}
 	}

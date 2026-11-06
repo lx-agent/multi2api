@@ -162,7 +162,6 @@
      ⚠ 这不是配色问题而是**语义可见性**问题：只加透明度与光标，不动 disabled 属性，
        所以 JS 那侧「合成行不可勾选 + title 说明原因」一个字都没变。 */
   #modelRows tr[data-synthetic="1"] input.rowcheck:disabled { opacity:.45; cursor:not-allowed; }
-  .ep { font-size:11px; color:var(--dim); }
   .empty { padding:18px 12px; color:var(--dim); }
 
   /* ── 6. 错误框 ───────────────────────────────────────────────────────── */
@@ -1613,7 +1612,7 @@ header.statline { align-items:baseline; }
     <div class="tw">
       <table id="modelsTable">
         <thead><tr>
-          <th class="c-chk"></th><th title="名称前的标记 = 成本倍率（来自 GET /admin/models/preview）；x无 = 该表没有这个模型，x0 = 免费">模型 ID</th><th>供应商</th><th>端点</th><th title="网关实测上游模型的输入类型（文本 / 文本和图片）；判据与剔除规则见 internal/server/model_caps.go；合成行与未探测的显示原因">输入类型</th><th title="按控制台 manifest 里该上游的账号数判定；口径见下方说明">可调用</th>
+          <th class="c-chk"></th><th title="名称前的标记 = 成本倍率（来自 GET /admin/models/preview）；x无 = 该表没有这个模型，x0 = 免费">模型 ID</th><th title="网关实测上游模型的输入类型（文本 / 文本和图片）；判据与剔除规则见 internal/server/model_caps.go；合成行与未探测的显示原因">输入类型</th><th class="num" title="上下文窗口（token 数）——上游目录元数据，随模型输入探针一起测得并缓存；上游没说则显示 —">上下文</th><th class="num" title="单次最大输出（token 数）——上游目录元数据，随模型输入探针一起测得并缓存；上游没说则显示 —">最大输出</th><th title="输出模态：文本（对话模型实测有文本/工具结论）或 图片（目录声明 image_generation 的生图模型）；— = 未知（未探测/判死/上游未声明）">输出模态</th>
         </tr></thead>
         <tbody id="modelRows"></tbody>
       </table>
@@ -1663,7 +1662,7 @@ header.statline { align-items:baseline; }
     filter: '',
     vendorFilter: '',
     updated: null,
-    // ── 2026-10-27 新增（勾选 / 倍率 / 可调用）────────────────────────
+    // ── 2026-10-27 新增（勾选 / 倍率）────────────────────────
     // selected 是**勾选的唯一真相**（按模型 id 记）。此前勾选只活在 DOM 的
     // checkbox 上，而 renderModels() 每次重绘都重建那些节点 ⇒ 勾选会静默丢失，
     // 而 #checkAll 与「已选 N 条」不会跟着回位（两个陈旧状态，用户看不出真假）。
@@ -1675,10 +1674,7 @@ header.statline { align-items:baseline; }
     // multByLast = `provider/末段` → 候选记录数组（只在长度 === 1 时采用，见 multLookup）。
     multByLast: {},
     multFailed: false,
-    multTried: false,
-    // acct = 「上游 id → 账号数」；null/undefined = 未知（manifest 没到，或没报该上游）。
-    acct: {},
-    acctLoaded: false
+    multTried: false
   };
 
   // ── 小工具 ────────────────────────────────────────────────────────────
@@ -1734,7 +1730,7 @@ header.statline { align-items:baseline; }
       // 而那与"网关没接线"在界面上无法区分。只报错，不毁现场。
       setErr('读取模型目录失败：' + (e && e.message ? e.message : e));
     });
-    return Promise.all([main, loadMultCatalog(), loadAcctCounts()]).then(function () { render(); });
+    return Promise.all([main, loadMultCatalog()]).then(function () { render(); });
   }
 
   // ── 渲染：总览 ────────────────────────────────────────────────────────
@@ -1751,18 +1747,16 @@ header.statline { align-items:baseline; }
     document.getElementById('upd').textContent = state.updated ? '更新于 ' + fmtClock(state.updated) : '';
   }
 
-  // ── 2026-10-27：倍率目录 / 可调用判定 / 复制（用户点名要的三件事）────────
+  // ── 2026-10-27：倍率目录 / 复制（用户点名要的三件事）────────────────────
 
-  // 两个端点都是**控制台身份**（会话 cookie）可达的：
-  //   · /admin/models/preview —— 全部目录模型的成本倍率（旧「可用模型」面板就是取它）
-  //   · /admin/ui/manifest    —— 上游清单 + 每个上游的 account_count
+  // 端点是**控制台身份**（会话 cookie）可达的：
+  //   /admin/models/preview —— 全部目录模型的成本倍率（旧「可用模型」面板就是取它）
   //
-  // ⚠ 为什么**不**用 /v1/models 判「可调用」：那把钥匙是 api_key（对话面），
+  // ⚠ 为什么**不**用 /v1/models 判：那把钥匙是 api_key（对话面），
   //   本页只有控制台会话 ⇒ 打它必然 401（这两套身份是刻意分离的，见 handler.go 的门禁分工）。
-  //   所以本页的判据取 manifest 的账号数 —— 与旧面板 renderModels 里
-  //   `g.accountCount === 0` 那条过滤**同源**，口径见 callCell 的注释。
+  //   （2026-11-06：「可调用」列与 manifest 取数已随该列一起移除 —— 账号数口径
+  //    被用户从目录页砍掉，管理面看上游健康请回控制台。）
   var MULT_ENDPOINT = '/admin/models/preview';
-  var MANIFEST_ENDPOINT = '/admin/ui/manifest';
 
   function getJSON(url) {
     return fetch(url, { credentials: 'same-origin', cache: 'no-store' }).then(function (r) {
@@ -1846,26 +1840,6 @@ header.statline { align-items:baseline; }
       state.mult = {};
       state.multByLast = {};
       state.multFailed = true;
-    });
-  }
-
-  // loadAcctCounts 取「上游 → 账号数」。同样**失败不抛**。
-  function loadAcctCounts() {
-    return getJSON(MANIFEST_ENDPOINT).then(function (m) {
-      var next = {};
-      var list = (m && m.providers) || [];
-      for (var i = 0; i < list.length; i++) {
-        var p = list[i];
-        if (!p || !p.id) { continue; }
-        // 三态：数字 = 真实账号数；null = 未知（manifest 没报这个上游）。
-        next[p.id] = (p.account_count === undefined || p.account_count === null)
-          ? null : Number(p.account_count);
-      }
-      state.acct = next;
-      state.acctLoaded = true;
-    }).catch(function () {
-      state.acct = {};
-      state.acctLoaded = false;   // 未知 ⇒ 列上写「未知」，绝不写「不可调用」
     });
   }
 
@@ -1993,35 +1967,6 @@ header.statline { align-items:baseline; }
     return tag;
   }
 
-  // callCell 渲染「可调用」单元格。
-  //
-  // # 口径（如实写清，别让用户以为它等于 /v1/models）
-  //   判据 = 控制台 manifest 里**该模型所属上游**的账号数 account_count：
-  //     >= 1 → 可调用      == 0 → 无可用账号（目录里有、现在调不到）      未知 → 未知
-  //   这条与旧「可用模型」面板 `g.accountCount === 0` 的过滤**同源**（同一份 manifest 字段）。
-  //
-  // ⚠ 局限（阶段二建议后端补字段）：它不等于「/v1/models 里真有这一条」——
-  //   那把 api_key 本页拿不到；账号存在但已过期/封禁时，这里仍会显示「可调用」。
-  function callCell(m) {
-    var td = el('td', 'callcol');
-    var v = m.vendor || '';
-    var known = state.acctLoaded && v && Object.prototype.hasOwnProperty.call(state.acct, v);
-    var n = known ? state.acct[v] : null;
-    var span;
-    if (!known || n === null || n === undefined) {
-      span = el('span', 'badge callunknown', '未知');
-      span.title = '账号数未知：控制台 manifest 还没到（或没报这个上游）——**不代表**不可调用';
-    } else if (Number(n) <= 0) {
-      span = el('span', 'badge callno', '无可用账号');
-      span.title = '该上游当前 0 个账号 ⇒ 目录里有、现在调不到（与旧「可用模型」面板的过滤同一条判据）';
-    } else {
-      span = el('span', 'badge callok', '可调用');
-      span.title = '该上游当前 ' + n + ' 个账号（manifest.account_count）';
-    }
-    td.appendChild(span);
-    return td;
-  }
-
   function modelRow(m) {
     var tr = document.createElement('tr');
     tr.className = 'modelrow';
@@ -2062,14 +2007,6 @@ header.statline { align-items:baseline; }
     tdName.appendChild(nb);
     tr.appendChild(tdName);
 
-    var tdV = el('td');
-    if (m.vendor) { tdV.appendChild(el('span', null, m.vendor)); }
-    else { tdV.appendChild(el('span', 'dim', '未知')); }
-    tr.appendChild(tdV);
-
-    var eps = (m.endpoints && m.endpoints.length) ? m.endpoints.join(' / ') : '';
-    if (eps) { tr.appendChild(el('td', 'ep', eps)); } else { tr.appendChild(el('td', 'ep', '—')); }
-
     // 输入类型列（需求 2026-11-05：原「来源」列改造）。
     // 数据来自 m.input_type（后端 catalogViewModel.InputType）：
     //   "text+image" ⇒ 文本和图片 · "text" ⇒ 文本
@@ -2102,9 +2039,45 @@ header.statline { align-items:baseline; }
       tdSrc.appendChild(bu);
     }
     tr.appendChild(tdSrc);
-    // 2026-10-27 新增两列（用户要求「表格需要再添加一列信息」+ 移植倍率检测）
-    tr.appendChild(callCell(m));
+
+    // 目录元数据三列（需求 2026-11-06，用户 m00003：删供应商/端点/可调用，增这三列）。
+    // 数据来自 m.context / m.max_output / m.output_modality（后端 catalogViewModel，
+    // 与 input_type 同一通道：model_caps.go 的探针缓存）。0/空串 = 上游没说 ⇒ 画「—」，
+    // 未知不冒充 0（与后端「未知≠零」同一条纪律）。
+    tr.appendChild(metaNumCell(m.context, '上游目录未给出上下文窗口长度（未探测、上游未声明，或该部署未开启 model_caps）'));
+    tr.appendChild(metaNumCell(m.max_output, '上游目录未给出单次最大输出（未探测、上游未声明，或该部署未开启 model_caps）'));
+
+    var tdMod = el('td');
+    if (m.output_modality === 'image') {
+      var bm = el('span', 'badge real', '图片');
+      bm.title = '目录声明为生图模型（capabilities 含 image_generation）——不走 chat 探测，输出即图片';
+      tdMod.appendChild(bm);
+    } else if (m.output_modality === 'text') {
+      var bt2 = el('span', 'badge real', '文本');
+      bt2.title = '探测拿到了文本/工具结论 ⇒ 输出为文本';
+      tdMod.appendChild(bt2);
+    } else {
+      var bd = el('span', 'badge callunknown', '—');
+      bd.title = '输出模态未知：未探测（sweep 未覆盖或未开启 model_caps）、判死模型、或上游未声明';
+      tdMod.appendChild(bd);
+    }
+    tr.appendChild(tdMod);
     return tr;
+  }
+
+  // metaNumCell 上下文/最大输出单元格：千分位数字，未知画「—」（title 说明为什么未知）。
+  function metaNumCell(n, whyUnknown) {
+    var td = el('td', 'num');
+    if (typeof n === 'number' && isFinite(n) && n > 0) {
+      var span = el('span', null, String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ','));
+      span.title = n + ' tokens';
+      td.appendChild(span);
+    } else {
+      var d = el('span', 'dim', '—');
+      d.title = whyUnknown;
+      td.appendChild(d);
+    }
+    return td;
   }
 
   function renderModels() {

@@ -32,6 +32,172 @@ func TestParseCapsValueRoundtrip(t *testing.T) {
 	}
 }
 
+// v2 七段往返（2026-11-06，用户 m00003：上下文/最大输出/输出模态随探针缓存持久化）。
+func TestParseCapsValueV2Roundtrip(t *testing.T) {
+	want := capResult{
+		Text: true, Vision: true, At: time.Unix(1_760_000_000, 0),
+		Context: 131072, MaxOut: 8192, OutMod: OutputModalityText,
+	}
+	v := formatCapsValue(want)
+	got, ok := parseCapsValue(v)
+	if !ok {
+		t.Fatalf("parseCapsValue(%q) not ok", v)
+	}
+	if got.Context != want.Context || got.MaxOut != want.MaxOut || got.OutMod != want.OutMod {
+		t.Fatalf("meta roundtrip mismatch: got %+v want %+v (raw %q)", got, want, v)
+	}
+	// 生图档：能力位全零 + OutMod=image，同样要能完整往返（sweep 落的就是它）。
+	img := capResult{At: time.Unix(1_760_000_000, 0), OutMod: OutputModalityImage}
+	got2, ok := parseCapsValue(formatCapsValue(img))
+	if !ok || got2.OutMod != OutputModalityImage || got2.Context != 0 || got2.Text {
+		t.Fatalf("image meta roundtrip mismatch: ok=%v got %+v", ok, got2)
+	}
+}
+
+// v1 四段兼容：旧档解析成功、元数据为零值（sweep 会原地回填，见 capsSweepOnce）。
+func TestParseCapsValueV1Compat(t *testing.T) {
+	got, ok := parseCapsValue("1,0,1,1760000000")
+	if !ok {
+		t.Fatal("v1 value must still parse")
+	}
+	if !got.Text || got.Tools || !got.Vision {
+		t.Fatalf("v1 capability bits wrong: %+v", got)
+	}
+	if got.Context != 0 || got.MaxOut != 0 || got.OutMod != "" {
+		t.Fatalf("v1 metadata must be zero-valued, got %+v", got)
+	}
+}
+
+// v2 档自身的脏值要拒：坏 mod、负数窗口、非数字窗口。
+func TestParseCapsValueV2RejectsGarbage(t *testing.T) {
+	for _, v := range []string{
+		"1,0,1,1760000000,131072,8192,banana", // mod 非法值：别猜
+		"1,0,1,1760000000,-1,8192,text",       // 负上下文
+		"1,0,1,1760000000,131072,-8192,text",  // 负最大输出
+		"1,0,1,1760000000,x,8192,text",        // ctx 非数字
+		"1,0,1,1760000000,131072,x,text",      // maxout 非数字
+		"1,0,1,1760000000,131072",             // 段数 5：既不是 v1 也不是 v2
+	} {
+		if _, ok := parseCapsValue(v); ok {
+			t.Fatalf("parseCapsValue(%q) should fail", v)
+		}
+	}
+}
+
+// 生图元数据结果（OutMod=image，无 chat 能力位）在三处判据的守卫：
+// modelVisible 放行（别被 ¬text∧¬tools 误杀）、inputTypeOf 空串（别把「没探
+// chat」说成「文本输入」）、capsMetaOf 把 mod 交给目录列。
+func TestImageMetaResultGuards(t *testing.T) {
+	h := newCapsHandler(t, true)
+	now := time.Now()
+	h.caps["draw"] = capResult{OutMod: OutputModalityImage, At: now}
+
+	if !h.modelVisible("draw") {
+		t.Fatal("image meta-only result must stay visible (no chat probe for image models)")
+	}
+	if got := h.inputTypeOf("draw"); got != "" {
+		t.Fatalf("image meta result inputType=%q, want empty", got)
+	}
+	ctx, maxOut, mod := h.capsMetaOf("draw")
+	if ctx != 0 || maxOut != 0 || mod != OutputModalityImage {
+		t.Fatalf("capsMetaOf(draw) = (%d,%d,%q)", ctx, maxOut, mod)
+	}
+	// 选人判据：生图模型没有 chat 结论，仍不该出现在 chat 候选里（手填兜底）。
+	if h.modelProbedAvailable("draw") {
+		t.Fatal("image meta-only result must not be a chat candidate")
+	}
+	// applyCapsFilter：生图条目即便只有 meta 结果也必须保留。
+	in := []map[string]any{{"id": "draw", "capabilities": []string{"image_generation"}}}
+	if out := h.applyCapsFilter(in); len(out) != 1 {
+		t.Fatalf("image entry with meta result must survive filter, got %d", len(out))
+	}
+}
+
+func TestCapsMetaOf(t *testing.T) {
+	h := newCapsHandler(t, true)
+	now := time.Now()
+	h.caps["full"] = capResult{Text: true, At: now, Context: 131072, MaxOut: 8192, OutMod: OutputModalityText}
+	h.caps["noMeta"] = capResult{Text: true, At: now} // v1 旧档回填前的中间态
+
+	ctx, maxOut, mod := h.capsMetaOf("full")
+	if ctx != 131072 || maxOut != 8192 || mod != OutputModalityText {
+		t.Fatalf("capsMetaOf(full) = (%d,%d,%q)", ctx, maxOut, mod)
+	}
+	if ctx, maxOut, mod := h.capsMetaOf("noMeta"); ctx != 0 || maxOut != 0 || mod != "" {
+		t.Fatalf("capsMetaOf(noMeta) = (%d,%d,%q), want zeros", ctx, maxOut, mod)
+	}
+	if ctx, maxOut, mod := h.capsMetaOf("never"); ctx != 0 || maxOut != 0 || mod != "" {
+		t.Fatalf("capsMetaOf(never) = (%d,%d,%q), want zeros", ctx, maxOut, mod)
+	}
+	// 探测关闭 ⇒ 惰性：目录列全空，不该凭空出现元数据。
+	off := newCapsHandler(t, false)
+	if ctx, maxOut, mod := off.capsMetaOf("full"); ctx != 0 || maxOut != 0 || mod != "" {
+		t.Fatalf("disabled probe must be inert, got (%d,%d,%q)", ctx, maxOut, mod)
+	}
+}
+
+// stampChatMeta：探针结果落盘前盖元数据戳。
+func TestStampChatMeta(t *testing.T) {
+	res := capResult{Text: true}
+	stampChatMeta(&res, 131072, 8192)
+	if res.Context != 131072 || res.MaxOut != 8192 {
+		t.Fatalf("meta not stamped: %+v", res)
+	}
+	if res.OutMod != OutputModalityText {
+		t.Fatalf("conclusive chat result must mark OutMod=text, got %q", res.OutMod)
+	}
+
+	// 上游没给的窗口字段不覆盖（0 = 未知，不是 0 = 已知为 0）；但只要拿到了
+	// 文本结论，输出模态就是「文本」—— 模态由探测结论决定，与窗口无关。
+	res2 := capResult{Text: true}
+	stampChatMeta(&res2, 0, 0)
+	if res2.Context != 0 || res2.MaxOut != 0 || res2.OutMod != OutputModalityText {
+		t.Fatalf("zero window meta must stay unknown, modality follows probe result: %+v", res2)
+	}
+
+	// 判死（¬text ∧ ¬tools）与不可达不许标 text —— 那是把「探不出」说成「文本输出」。
+	dead := capResult{At: time.Now()}
+	stampChatMeta(&dead, 4096, 1024)
+	if dead.OutMod != "" || dead.Context != 4096 {
+		t.Fatalf("dead result must keep OutMod empty, got %+v", dead)
+	}
+
+	// 已有 OutMod 不改写（image 条目混进探测路径时保住原值）。
+	img := capResult{OutMod: OutputModalityImage, Text: true}
+	stampChatMeta(&img, 8, 8)
+	if img.OutMod != OutputModalityImage {
+		t.Fatalf("existing OutMod must not be overwritten, got %q", img.OutMod)
+	}
+}
+
+// capsEntryMeta：目录条目元数据抽取的**类型容忍** —— entryOf 写进去的可能是
+// int / int64 / float64（JSON 反序列化的常见落点），只认 >0。
+func TestCapsEntryMeta(t *testing.T) {
+	if ctx, maxOut := capsEntryMeta(map[string]any{
+		"context_length": 131072, "max_output_tokens": int64(8192),
+	}); ctx != 131072 || maxOut != 8192 {
+		t.Fatalf("typed values: (%d,%d)", ctx, maxOut)
+	}
+	if ctx, maxOut := capsEntryMeta(map[string]any{
+		"context_length": 131072.0, "max_output_tokens": 8192.0, // encoding/json → float64
+	}); ctx != 131072 || maxOut != 8192 {
+		t.Fatalf("float64 values: (%d,%d)", ctx, maxOut)
+	}
+	if ctx, maxOut := capsEntryMeta(map[string]any{
+		"context_length": 0, "max_output_tokens": -1, // 0 与负数都是「没说」
+	}); ctx != 0 || maxOut != 0 {
+		t.Fatalf("non-positive must be unknown: (%d,%d)", ctx, maxOut)
+	}
+	if ctx, maxOut := capsEntryMeta(map[string]any{
+		"context_length": "131072", // 字符串：不是数字类型，别猜
+	}); ctx != 0 || maxOut != 0 {
+		t.Fatalf("string value must be ignored: (%d,%d)", ctx, maxOut)
+	}
+	if ctx, maxOut := capsEntryMeta(map[string]any{}); ctx != 0 || maxOut != 0 {
+		t.Fatalf("empty entry: (%d,%d)", ctx, maxOut)
+	}
+}
+
 func TestParseCapsValueRejectsGarbage(t *testing.T) {
 	for _, v := range []string{
 		"", "1", "1,0", "1,0,1", // 段数不足

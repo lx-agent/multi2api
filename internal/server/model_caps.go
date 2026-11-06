@@ -95,6 +95,13 @@ const (
 //   - **不可达标记**（Unreachable=true）：尝试过但拿不到结论（没号/链路失败/
 //     5xx/429/解析失败）。不判死、不剔除，页面显示「不可达」；**每轮 sweep
 //     重探**，上游恢复即被确定性结果覆盖。Reason 只在内存，供日志定位。
+//
+// Context/MaxOut/OutMod 是 2026-11-06 新增的**目录元数据**（用户 m00003：模型
+// 目录页要展示上下文窗口 / 最大输出 / 输出模态，且要与输入探针同一数据通道）：
+// 它们不来自探测请求本身，而是 sweep 枚举原始目录时从条目的
+// context_length / max_output_tokens / capabilities 里抄下来、随结果一起盖戳
+// 持久化。0/空串 = 上游没说（未知不等于零）。生图模型没有 chat 结论，
+// 只落一条 OutMod="image" 的元数据结果（见 capsSweepOnce）。
 type capResult struct {
 	Text        bool // 最小文本请求拿到了非空应答
 	Tools       bool // 工具调用探测拿到了带函数名的 tool_calls
@@ -102,6 +109,10 @@ type capResult struct {
 	Unreachable bool // 尝试过但无结论（见上）；true 时三个能力位无意义
 	Reason      string
 	At          time.Time
+
+	Context int64  // 上下文窗口（token 数；上游目录元数据，0=未知）
+	MaxOut  int64  // 单次最大输出（token 数；0=未知）
+	OutMod  string // 输出模态：OutputModalityText / OutputModalityImage / ""=未知
 }
 
 // conclusive 是否为确定性结果（永久有效、不再重探）。
@@ -130,6 +141,13 @@ const (
 	InputTypeText        = "text"
 	InputTypeTextImage   = "text+image"
 	InputTypeUnreachable = "unreachable"
+)
+
+// 输出模态取值（catalogViewModel.output_modality）。空串 = 未知（未探测/判死/
+// 上游没声明），页面显示「—」；绝不把未知画成「文本」。
+const (
+	OutputModalityText  = "text"
+	OutputModalityImage = "image"
 )
 
 // capsEnabled 探测机制是否装配开启。
@@ -194,7 +212,8 @@ func (h *Handler) clearProbing(id string) {
 // **不可达标记 → 同样剔除**（用户明确：已失效的不显示）。与判死的区别：
 // 不可达不落盘、每轮 sweep 重探，上游恢复即自动回到目录；判死永久有效、
 // 不重探。剔除原因逐条写网关日志（capsSweep/capsProbe 行），页面不再兜留。
-// 生图模型不走 chat 探测，由调用方（applyCapsFilter）单独放行。
+// 生图模型的元数据结果（OutMod="image"，无能力位）→ 放行：它不是「探不出
+// 能力」，是「根本不走 chat 探测」，别让能力位判死误杀它。
 func (h *Handler) modelVisible(id string) bool {
 	if !h.capsEnabled() {
 		return true
@@ -202,6 +221,9 @@ func (h *Handler) modelVisible(id string) bool {
 	res, ok := h.capsKnown(id)
 	if !ok {
 		return true
+	}
+	if res.OutMod == OutputModalityImage {
+		return true // 生图目录条目的 meta-only 结果（见 capsSweepOnce）
 	}
 	if res.Unreachable {
 		return false
@@ -241,6 +263,10 @@ func (h *Handler) ModelProbedAvailable(id string) bool {
 }
 
 // inputTypeOf 需求二的列值：目录行 → "text"/"text+image"/""。
+//
+// 生图模型落的是 OutMod="image" 的元数据结果（没有 chat 结论），若不加守卫
+// 会按能力位默认值输出 "text" —— 那是把「没探」说成「探过是文本」。保持
+// 空串（页面显示「未探测」）与生图条目的既有口径一致。
 func (h *Handler) inputTypeOf(id string) string {
 	if !h.capsEnabled() {
 		return ""
@@ -249,7 +275,23 @@ func (h *Handler) inputTypeOf(id string) string {
 	if !ok {
 		return ""
 	}
+	if res.OutMod == OutputModalityImage {
+		return ""
+	}
 	return res.inputType()
+}
+
+// capsMetaOf 目录元数据列（上下文/最大输出/输出模态）的统一取数口：
+// 与 inputTypeOf 同一通道（探针缓存），store 档与 memory 档行为一致。
+func (h *Handler) capsMetaOf(id string) (int64, int64, string) {
+	if !h.capsEnabled() {
+		return 0, 0, ""
+	}
+	res, ok := h.capsKnown(id)
+	if !ok {
+		return 0, 0, ""
+	}
+	return res.Context, res.MaxOut, res.OutMod
 }
 
 // capsIsImageEntry 目录条目是否被标为生图模型（capabilities 含 image_generation）。
@@ -359,13 +401,20 @@ func (h *Handler) loadCapsFromStore() {
 
 // formatCapsValue/parseCapsValue 是一对：persistCaps 写出的就是 parseCapsValue
 // 吃的格式（测试靠这条往返，别让两侧各自漂移）。
+//
+// 格式 v2（2026-11-06）：7 段 "text,tools,vision,atUnix,ctx,maxout,mod"。
+// v1 的 4 段仍可解析（旧档回填后 Context/MaxOut/OutMod 为零值，sweep 会
+// 原地补齐元数据再落回 v2 —— 零请求成本，判死不重探的语义不受影响）。
+// mod 只认 ""/"text"/"image"，其它值是写坏的档，别猜。
 func formatCapsValue(res capResult) string {
-	return fmt.Sprintf("%d,%d,%d,%d", b2i(res.Text), b2i(res.Tools), b2i(res.Vision), res.At.Unix())
+	return fmt.Sprintf("%d,%d,%d,%d,%d,%d,%s",
+		b2i(res.Text), b2i(res.Tools), b2i(res.Vision), res.At.Unix(),
+		res.Context, res.MaxOut, res.OutMod)
 }
 
 func parseCapsValue(v string) (capResult, bool) {
 	parts := strings.Split(v, ",")
-	if len(parts) != 4 {
+	if len(parts) != 4 && len(parts) != 7 {
 		return capResult{}, false
 	}
 	var tt, uu, ww, ss int64
@@ -386,7 +435,21 @@ func parseCapsValue(v string) (capResult, bool) {
 	if ss < capsPersistedAtMinUnixSecs {
 		return capResult{}, false
 	}
-	return capResult{Text: tt == 1, Tools: uu == 1, Vision: ww == 1, At: time.Unix(ss, 0)}, true
+	res := capResult{Text: tt == 1, Tools: uu == 1, Vision: ww == 1, At: time.Unix(ss, 0)}
+	if len(parts) == 7 {
+		ctxTok, err1 := strconv.ParseInt(parts[4], 10, 64)
+		maxOut, err2 := strconv.ParseInt(parts[5], 10, 64)
+		if err1 != nil || err2 != nil || ctxTok < 0 || maxOut < 0 {
+			return capResult{}, false
+		}
+		switch parts[6] {
+		case "", OutputModalityText, OutputModalityImage:
+		default:
+			return capResult{}, false
+		}
+		res.Context, res.MaxOut, res.OutMod = ctxTok, maxOut, parts[6]
+	}
+	return res, true
 }
 
 func b2i(b bool) int {
@@ -431,6 +494,13 @@ func (h *Handler) StartModelCapsProbe(ctx context.Context) {
 
 // capsSweepOnce 一轮扫描：枚举**过滤前**的原始目录，只对**尚无结果**且不在探的
 // 模型并行探测（结果永久有效 ⇒ 稳态下这里通常是空队列）。
+//
+// 2026-11-06 起同时承担目录元数据（上下文/最大输出/输出模态）的盖戳：
+//   - 生图条目不走 chat 探测，但「输出模态=图片」是目录声明的确定事实，
+//     落一条 meta-only 结果（无能力位），页面的输出模态列才不依赖 memory 档；
+//   - chat 条目把条目里的 context_length / max_output_tokens 抄进 job，
+//     探测完成后随结果一起记录；已有结论缺元数据时**原地回填**（零请求成本，
+//     「判死不重探」语义不变）。
 func (h *Handler) capsSweepOnce(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -442,8 +512,13 @@ func (h *Handler) capsSweepOnce(ctx context.Context) {
 	}
 	raw := h.modelListRawWithScrub(false)
 
-	type job struct{ id, provider, bare string }
+	type job struct {
+		id, provider, bare string
+		ctxTok, maxOutTok  int64 // 目录条目自带的上下文/最大输出（0=上游没说）
+	}
 	jobs := make([]job, 0, len(raw))
+	var backfills []job
+	var imgRecs []string // 待记元数据的生图条目（锁外落账，recordCaps 自己拿锁）
 	h.capsMu.Lock()
 	if h.caps == nil {
 		h.caps = map[string]capResult{}
@@ -452,17 +527,32 @@ func (h *Handler) capsSweepOnce(ctx context.Context) {
 		h.capsProbing = map[string]bool{}
 	}
 	for _, e := range raw {
-		if capsIsImageEntry(e) {
-			continue // 生图模型不走 chat，探测必然误判死 —— 豁免
-		}
 		id, _ := e["id"].(string)
 		if id == "" {
 			continue
 		}
-		if res, ok := h.caps[id]; ok && res.conclusive() {
-			continue // 确定性结果（含判死）永久跳过 —— 用户修订 2026-11-05：判死不重探、无新模型不探。
-			// 不可达标记**不算有结果**：每轮重探，上游恢复即被确定性结果覆盖（用户 m01504：不可用要写清楚）。
+		if capsIsImageEntry(e) {
+			// 生图模型不走 chat，探测必然误判死 —— 豁免；但输出模态是
+			// 目录声明的确定事实，记 meta-only 结果供页面取数。
+			if res, ok := h.caps[id]; ok && res.conclusive() && res.OutMod == OutputModalityImage {
+				continue // 已记录，且生图元数据不会变 —— 稳态零写入
+			}
+			imgRecs = append(imgRecs, id)
+			continue
 		}
+		ctxTok, maxOutTok := capsEntryMeta(e)
+		if res, ok := h.caps[id]; ok && res.conclusive() && res.OutMod != OutputModalityImage {
+			// 确定性结果（含判死）永久跳过 —— 用户修订 2026-11-05：判死不重探、无新模型不探。
+			// 不可达标记**不算有结果**：每轮重探，上游恢复即被确定性结果覆盖（用户 m01504：不可用要写清楚）。
+			// 旧档（v1 或更早 sweep）缺元数据时原地补齐 —— 不重探、只补账。
+			if res.Context == 0 && ctxTok > 0 || res.MaxOut == 0 && maxOutTok > 0 ||
+				res.OutMod == "" && (res.Text || res.Tools) {
+				backfills = append(backfills, job{id: id, ctxTok: ctxTok, maxOutTok: maxOutTok})
+			}
+			continue
+		}
+		// （conclusive 且 OutMod=="image" 的情形：条目已不再声明生图 —— 旧的
+		//   元数据结果作废，按普通 chat 条目重新探测，新结果会覆盖它。）
 		if h.capsProbing[id] {
 			continue // 上一轮还在探（极端慢上游）
 		}
@@ -473,9 +563,20 @@ func (h *Handler) capsSweepOnce(ctx context.Context) {
 		} else if i := strings.IndexByte(id, '/'); i > 0 {
 			provider, bare = id[:i], id[i+1:]
 		}
-		jobs = append(jobs, job{id, provider, bare})
+		jobs = append(jobs, job{id, provider, bare, ctxTok, maxOutTok})
 	}
 	h.capsMu.Unlock()
+
+	// 生图元数据与旧结论回填都放在锁外做（recordCaps 自己会再拿锁）。
+	for _, id := range imgRecs {
+		h.recordCaps(id, capResult{OutMod: OutputModalityImage, At: time.Now()})
+	}
+	for _, bf := range backfills {
+		if res, ok := h.capsKnown(bf.id); ok {
+			stampChatMeta(&res, bf.ctxTok, bf.maxOutTok)
+			h.recordCaps(bf.id, res)
+		}
+	}
 
 	// sort 让日志/测试的调度顺序确定（map 遍历顺序不参与判据，但确定性零成本）。
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].id < jobs[j].id })
@@ -501,6 +602,7 @@ func (h *Handler) capsSweepOnce(ctx context.Context) {
 				}
 			}()
 			res := h.probeModel(ctx, j.provider, j.bare) // ctx 是 sweep 入参（循环外单值），闭包捕获安全
+			stampChatMeta(&res, j.ctxTok, j.maxOutTok)
 			h.recordCaps(j.id, res)
 			statMu.Lock()
 			if res.conclusive() {
@@ -515,6 +617,46 @@ func (h *Handler) capsSweepOnce(ctx context.Context) {
 	wg.Wait()
 	if len(jobs) > 0 {
 		log.Printf("capsSweep: probed %d · conclusive %d · unreachable %d", len(jobs), doneC, doneU)
+	}
+}
+
+// capsEntryMeta 从原始目录条目抄上下文/最大输出。键只在 >0 时写（entryOf 的
+// 未知≠零纪律），缺键 = 上游没说 = 0。值可能是 int64（entryOf）、int（内置
+// 静态表）或 JSON 反序列化出来的 float64，逐个容忍。
+func capsEntryMeta(e map[string]any) (int64, int64) {
+	return entryInt64(e, "context_length"), entryInt64(e, "max_output_tokens")
+}
+
+func entryInt64(e map[string]any, key string) int64 {
+	switch v := e[key].(type) {
+	case int:
+		if v > 0 {
+			return int64(v)
+		}
+	case int64:
+		if v > 0 {
+			return v
+		}
+	case float64:
+		if v > 0 {
+			return int64(v)
+		}
+	}
+	return 0
+}
+
+// stampChatMeta 把目录元数据盖到 chat 探测结果上。ctx/maxout 只在 >0 时写
+// （0 不覆盖已有值）；输出模态只有拿到 chat 能力结论时才标 "text" ——
+// 判死/不可达的模型保持 ""（未知），别把「探不出」说成「文本」。
+func stampChatMeta(res *capResult, ctxTok, maxOutTok int64) {
+	if ctxTok > 0 {
+		res.Context = ctxTok
+	}
+	if maxOutTok > 0 {
+		res.MaxOut = maxOutTok
+	}
+	if res.OutMod == "" && (res.Text || res.Tools) {
+		res.OutMod = OutputModalityText
 	}
 }
 
