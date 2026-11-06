@@ -4055,7 +4055,8 @@ function mpEsc(s) {
   let loginPoll = null;    // 添加账号的轮询句柄
   let loginDeadline = 0;
 // loginProvider 本次登录针对哪个上游（T10）。用于弹窗文案与结果提示 ——
-// 后端目前只认默认上游，回传 provider 时以它为准。
+// 更关键的是 poll 请求体必须带上它（与 start 同一条分派规则），
+// 由 addAccount 在发起登录时赋值。
 let loginProvider = '';
   let keyRevealed = false; // API 面板里 Key 是否明文显示
 
@@ -7792,6 +7793,12 @@ function toast(msg, bad) {
   async function addAccount(providerId, btn) {
     openModal();
     const want = providerId || '';
+    // ⚠ 必须写回全局 loginProvider —— 轮询（本函数下方 setInterval 里）读的是
+    // 这个全局变量。这里曾漏了赋值，loginProvider 恒为 ''，于是 poll 不带
+    // provider → 后端按"旧路径"用**默认上游**的 OAuth 去认**别的上游**（或
+    // workbuddy flow 实例）的 state → 首轮 poll 就 410
+    // `oauth: state 不存在或已超期，请重新发起授权`。
+    loginProvider = want;
     $('loginTitle').textContent = want ? ('添加 ' + providerTitle(want) + ' 账号') : '添加账号';
     renderLoginLocalHint();
     renderLoginIntro('browser'); // 申请期间的占位；拿到回执后按形态改写
